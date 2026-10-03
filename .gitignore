@@ -33,3 +33,7 @@ art-guest-data.img*
 qemu-console-art.log*
 dump/
 .zwork/
+
+# 打包工作目录（pack-assets.ps1 的产物与暂存区）
+_assets/
+_stage/
