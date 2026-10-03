@@ -307,6 +307,19 @@ public sealed class QemuHostRuntime : IDisposable
             return Task.FromResult(false);
         }
 
+        // 策略（2026-10-03 用户拍板）：x86 运行时**不做软件模拟**。
+        // WHPX（Windows 虚拟机监控程序平台）不可用时直接判不可用 —— 让上层干净回落到内置 BT，
+        // 而不是起一个 TCG 下慢 10~20 倍、还跑不完上层超时预算的 VM（用户实测体验太差）。
+        // 例外：显式用 CATCLAW_QEMU_ACCEL 指定后端时（排障/对比）按指定的来，不拦。
+        if (Arch == GuestArch.X86_64
+            && string.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable("CATCLAW_QEMU_ACCEL"))
+            && !WhpxProbe.IsAvailable())
+        {
+            _log?.Invoke("[qemu] 未启用 WHPX（虚拟机监控程序平台）→ x86 运行时不做软件模拟，判引擎不可用；" +
+                         "磁力将回落内置 BT。启用该功能后重启即可（启动画面的启动自检可一键开启）");
+            return Task.FromResult(false);
+        }
+
         try
         {
             ReapStaleVmOnOurPorts();
@@ -349,6 +362,10 @@ public sealed class QemuHostRuntime : IDisposable
                 netdev += $",hostfwd=tcp:127.0.0.1:{AdbPort}-:5555";
                 _log?.Invoke($"[qemu] adb 隧道已开：adb connect 127.0.0.1:{AdbPort}（guest 内 adbd 由桥拉起）");
             }
+            // 加速后端可强制覆盖（排障/对比用）：CATCLAW_QEMU_ACCEL=tcg 强制软件模拟，
+            // whpx 强制硬件虚拟化（不给兜底）。默认留空 = 下面的多 -accel 依次尝试。
+            var accelOverride = Environment.GetEnvironmentVariable("CATCLAW_QEMU_ACCEL");
+
             var args = new List<string>
             {
                 // -m 5120：guest RAM 需容得下 /thunder-data 的 tmpfs（3500m，见 initrd 的 /init）+ 引擎开销；
@@ -375,7 +392,7 @@ public sealed class QemuHostRuntime : IDisposable
                 "-cpu", Arch == GuestArch.X86_64 ? "max" : "cortex-a76",
                 "-m", memMb.ToString(), "-smp", SmpCount.ToString(), "-nographic",
                 "-accel", Arch == GuestArch.X86_64
-                    ? "whpx"
+                    ? (string.IsNullOrWhiteSpace(accelOverride) ? "whpx" : accelOverride)
                     : "tcg,tb-size=256,split-wx=off",
                 "-L", "share",
                 "-kernel", KernelName,
@@ -406,8 +423,8 @@ public sealed class QemuHostRuntime : IDisposable
                 args.AddRange(["-object", $"filter-dump,id=dump0,netdev=n0,file={pcapPath}"]);
                 _log?.Invoke($"[qemu] 网络抓包已开启 → {pcapPath}");
             }
-            if (Arch == GuestArch.X86_64)
-                args.AddRange(["-accel", "tcg,tb-size=256,split-wx=off"]);   // WHPX 不可用时的兜底加速后端
+            // 注：x86 原本在这里追加 -accel tcg 兜底，2026-10-03 按用户要求撤掉 ——
+            //     WHPX 不可用时上面已直接判不可用，不再做软件模拟（要对比/排障用 CATCLAW_QEMU_ACCEL=tcg）。
 
             // ── 数据面块设备（可选）──
             // guest 侧 harness 把引擎吐出的字节按文件偏移写进 /dev/vda，宿主随后**直读同一文件**
