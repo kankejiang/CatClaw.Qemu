@@ -167,7 +167,15 @@ public sealed class QemuHostRuntime : IDisposable
     public (int Host, int Guest)? GoProxyTunnel { get; set; }
 
     /// <summary>启用 swap 时的 guest RAM（MB）—— 冷页能换出，取值可小得多。</summary>
-    public int GuestMemoryMbWithSwap { get; set; } = 2560;
+    /// <summary>
+    /// 有 swap 时的 guest 内存（<c>-m</c>）。2026-10-03：2560 → **4096**。
+    ///
+    /// <para>起因：用户反馈「几百集的视频会把 ART guest 里的桥弄崩，宿主报『桥崩溃退出、引擎已重置』」。
+    /// guest 空闲时内存充足（实测 Mem 2466MB / free 1103MB、无 OOM、无 tombstone），
+    /// 怀疑是**解析超大选集那一刻的内存尖峰**把桥顶爆 ⇒ 先按最便宜的手段给足内存。
+    /// 宿主 31.9GB 内存、当时可用 11.1GB，4096 有余量。</para>
+    /// </summary>
+    public int GuestMemoryMbWithSwap { get; set; } = 4096;
 
     /// <summary>无 swap 时 <c>/thunder-data</c> 的 tmpfs 大小（MB）。</summary>
     public int DataDirMb { get; set; } = 3500;
