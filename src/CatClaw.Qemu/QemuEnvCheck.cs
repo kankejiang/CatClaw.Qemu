@@ -38,13 +38,12 @@ public static class QemuEnvCheck
 
         // ① WHPX：有它才有硬件虚拟化，否则 QEMU 回落 TCG（指令级软件模拟，慢 10~20 倍）。
         //    文案按「名称 + 值」两栏设计：值要短，处置建议放 Hint（UI 第二行展示）。
-        var whpx = WhpxProbe.IsAvailable();
-        items.Add(whpx
+        var whpx = WhpxProbe.Probe();
+        items.Add(whpx == WhpxStatus.Available
             ? new QemuEnvItem("whpx", "硬件加速", QemuEnvLevel.Ok, "WHPX 已启用")
             : new QemuEnvItem("whpx", "硬件加速", QemuEnvLevel.Warn,
                 "未启用 · 回落软件模拟",
-                "启用 Windows 功能「虚拟机监控程序平台」(HypervisorPlatform) 后重启；" +
-                "注意它与「任务管理器显示虚拟化已启用」「Hyper-V 全开」不是一回事"));
+                WhpxHint(whpx)));
 
         // ② QEMU 引擎
         var exe = Path.Combine(runtimeDir, QemuExeName);
@@ -72,4 +71,20 @@ public static class QemuEnvCheck
 
         return items;
     }
+
+    /// <summary>
+    /// 按根因给 WHPX 的处置办法——两种情况差很多：功能没开就开功能；hypervisor 没跑起来
+    /// 时开功能没用，得看 BIOS 的 VT-x/AMD-V 或 hypervisorlaunchtype。
+    /// </summary>
+    private static string WhpxHint(WhpxStatus status) => status switch
+    {
+        WhpxStatus.FeatureMissing =>
+            "「虚拟机监控程序平台」功能未开：点下方「一键启用虚拟化」提权开启（同时开 HypervisorPlatform 与 " +
+            "VirtualMachinePlatform），或手动在「启用或关闭 Windows 功能」里勾选；重启后生效。" +
+            "注意它与「任务管理器显示虚拟化已启用」「Hyper-V 全开」不是一回事，回落软件模拟会慢 10~20 倍。",
+        _ =>
+            "功能已开但 hypervisor 没跑起来：① 进 BIOS/UEFI 确认 Intel VT-x / AMD-V（SVM）已启用；" +
+            "② 若曾用 bcdedit 关过，管理员执行 bcdedit /set hypervisorlaunchtype auto；③ 重启。" +
+            "开功能这一招对这种情况无效。",
+    };
 }

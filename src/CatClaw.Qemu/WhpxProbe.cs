@@ -20,24 +20,67 @@ namespace CatClaw.Qemu;
 public static class WhpxProbe
 {
     private const uint WHvCapabilityCodeHypervisorPresent = 0x0;
-    private static int? _cached;   // 1=可用 0=不可用；null=未探测
+    private static WhpxStatus? _cached;   // 进程内缓存：平台功能开关注销才生效
 
     [DllImport("WinHvPlatform.dll", SetLastError = false)]
     private static extern int WHvGetCapability(uint capabilityCode, out uint capabilityValue,
         uint capabilityValueSize, out uint writtenSize);
 
     /// <summary>WHPX 是否可用（进程内缓存）。</summary>
-    public static bool IsAvailable()
+    public static bool IsAvailable() => Probe() == WhpxStatus.Available;
+
+    /// <summary>
+    /// 探测并给出**不可用的根因**——三种情况的处置办法完全不同：
+    /// <list type="bullet">
+    /// <item><see cref="WhpxStatus.FeatureMissing"/>：可选功能没开 → 开功能（DISM/optionalfeatures）即可。</item>
+    /// <item><see cref="WhpxStatus.HypervisorNotRunning"/>：DLL 在但 hypervisor 没跑 → BIOS 里 VT-x/AMD-V
+    /// 可能被关，或 hypervisorlaunchtype 被设成 off，开功能没用。</item>
+    /// <item><see cref="WhpxStatus.Available"/>：可直接 <c>-accel whpx</c>。</item>
+    /// </list>
+    /// </summary>
+    public static WhpxStatus Probe()
     {
-        if (_cached is { } v) return v == 1;
+        // 开发/排障钩子：环境变量 CATCLAW_WHPX=on|missing|norun 强制探测结果。
+        // 用途：本机 WHPX 正常时，仍能预览「未启用」的界面与处置流程（含一键启用/详细步骤）。
+        // 正常用户环境不会设置它，判定逻辑不受影响。
+        if (Environment.GetEnvironmentVariable("CATCLAW_WHPX") is { Length: > 0 } forced)
+        {
+            _cached = forced.ToLowerInvariant() switch
+            {
+                "on" => WhpxStatus.Available,
+                "missing" => WhpxStatus.FeatureMissing,
+                _ => WhpxStatus.HypervisorNotRunning,
+            };
+            return _cached.Value;
+        }
+
+        if (_cached is { } v) return v;
         try
         {
             var hr = WHvGetCapability(WHvCapabilityCodeHypervisorPresent, out uint value,
                 sizeof(uint), out uint written);
-            _cached = hr == 0 && value == 1 && written == sizeof(uint) ? 1 : 0;
+            _cached = hr == 0 && value == 1 && written == sizeof(uint)
+                ? WhpxStatus.Available
+                : WhpxStatus.HypervisorNotRunning;
         }
-        catch (DllNotFoundException) { _cached = 0; }   // HypervisorPlatform 功能未开（WinHvPlatform.dll 不在）
-        catch (EntryPointNotFoundException) { _cached = 0; }
-        return _cached == 1;
+        catch (DllNotFoundException)
+        {
+            // 功能没开：WinHvPlatform.dll 整个不存在（系统里没有 whpx.dll 这个文件）
+            _cached = WhpxStatus.FeatureMissing;
+        }
+        catch (EntryPointNotFoundException) { _cached = WhpxStatus.FeatureMissing; }
+        catch (Exception) { _cached = WhpxStatus.HypervisorNotRunning; }
+        return _cached.Value;
     }
+}
+
+/// <summary>WHPX 探测结果（决定给用户哪一套处置办法）。</summary>
+public enum WhpxStatus
+{
+    /// <summary>功能在且 hypervisor 在跑，QEMU 可用 -accel whpx。</summary>
+    Available,
+    /// <summary>可选功能「虚拟机监控程序平台」没开（WinHvPlatform.dll 缺失）。</summary>
+    FeatureMissing,
+    /// <summary>功能已开但 hypervisor 未运行（BIOS 里虚拟化被关 / hypervisorlaunchtype=off 等）。</summary>
+    HypervisorNotRunning,
 }
