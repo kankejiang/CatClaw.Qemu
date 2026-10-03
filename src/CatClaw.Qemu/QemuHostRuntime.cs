@@ -521,13 +521,52 @@ public sealed class QemuHostRuntime : IDisposable
         _log?.Invoke(e.Data);
     }
 
+    /// <summary>
+    /// console 日志上限（64MB）。QEMU guest 的 logcat/adbd 噪声能把它涨到 GB 级 ——
+    /// 2026-10-03 实测单个会话 3.1GB，数据目录里还有上百个手工轮转留下的 .old* 副本共 5GB。
+    /// 超限即轮转，只保留一个 .old，避免没人回收地占盘。
+    /// </summary>
+    private const long ConsoleLogMaxBytes = 64L * 1024 * 1024;
+
+    private int _fileLines;
+
+    private void RollConsoleLogIfNeeded()
+    {
+        try
+        {
+            var fi = new FileInfo(ConsoleLogPath);
+            if (!fi.Exists || fi.Length < ConsoleLogMaxBytes) return;
+            _fileLog?.Flush();
+            _fileLog?.Dispose();
+            _fileLog = null;
+            RotateConsoleLogFile();
+            OpenFileLog();
+        }
+        catch { }
+    }
+
+    /// <summary>把当前日志挪成 .old（只留一份）。</summary>
+    private void RotateConsoleLogFile()
+    {
+        try
+        {
+            var old = ConsoleLogPath + ".old";
+            try { if (File.Exists(old)) File.Delete(old); } catch { }
+            try { File.Move(ConsoleLogPath, old); } catch { }
+        }
+        catch { }
+    }
+
     private void OpenFileLog()
     {
         try
         {
             Directory.CreateDirectory(Path.GetDirectoryName(ConsoleLogPath)!);
+            if (File.Exists(ConsoleLogPath) && new FileInfo(ConsoleLogPath).Length >= ConsoleLogMaxBytes)
+                RotateConsoleLogFile();
             _fileLog = new StreamWriter(new FileStream(ConsoleLogPath, FileMode.Append, FileAccess.Write, FileShare.ReadWrite), Encoding.UTF8) { AutoFlush = true };
             _fileLog.WriteLine($"\n===== QEMU 启动 {DateTime.Now:yyyy-MM-dd HH:mm:ss} =====");
+            _fileLines = 0;
         }
         catch { _fileLog = null; }
     }
