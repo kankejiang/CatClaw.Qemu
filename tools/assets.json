@@ -14,6 +14,12 @@
       "size": 29797398,
       "sha256": "15405edac95dab8401a74858a1811592bd8a307b498b9744d9a800e868fd3634",
       "tag": "vm-assets-v1"
+    },
+    {
+      "name": "x86guest-build-inputs.tar.gz",
+      "size": 646409681,
+      "sha256": "4573db356ad280ad7f6621fa0bb251c63a57fb892320535f5333373e3a6ffd1a",
+      "tag": "vm-assets-v1"
     }
   ]
 }
