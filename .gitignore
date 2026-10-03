@@ -1,0 +1,35 @@
+# ── 构建产物（可再生，不入库）──
+bin/
+obj/
+*.user
+*.suo
+.vs/
+
+# ART boot 镜像（108 主机 dex2oat 产物，管线可再生；进了会撞 GitHub 单文件限制）
+guest/qemu-src/art/bootimg/
+guest/qemu-src/art/dalvik-preinit/
+
+# 打包产物与中间件（由 pack-assets.ps1 生成、或从 Release 下载）
+*.gz
+*.tar.gz
+*.tar
+*.zip
+*.cpio
+*.img
+*.img.bak*
+*.bak_cpu
+*.a1
+*.a2
+*.vdex
+*.art
+*.odex
+*.oat
+*.lst
+*.log
+*.pcap
+
+# 运行/调试残留
+art-guest-data.img*
+qemu-console-art.log*
+dump/
+.zwork/

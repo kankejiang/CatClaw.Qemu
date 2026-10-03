@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!-- TFM 与宿主 Core 保持一致（net11.0，Android/Windows 共用）：
+         引擎只在 Windows 上运行，但编译期要被跨平台的 Core 引用（JavaSpiderRuntime 等），
+         所以不能带 -windows；平台判定一律走 OperatingSystem.IsWindows()。 -->
+    <TargetFramework>net11.0</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>15.0</LangVersion>
+    <RootNamespace>CatClaw.Qemu</RootNamespace>
+    <AssemblyName>CatClaw.Qemu</AssemblyName>
+  </PropertyGroup>
+</Project>
