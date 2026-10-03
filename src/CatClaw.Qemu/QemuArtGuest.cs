@@ -294,7 +294,7 @@ public sealed class QemuArtGuest : IDisposable
                 // 里几十次 TLS 握手在 TCG 下是纯 CPU 计算，多核能让它们真并行；TCG 实测吞吐峰值
                 // 在 2~4 vCPU（docs/qemu-tcg-tuning.md §6，>4 反而更慢），4 是上限取值。
                 // 合并模式要同时扛「桥 + 迅雷引擎」，内存上调（有 swap 时冷页可换出）
-                GuestMemoryMb = ThunderMerged ? 4096 : 2048,   // 2026-10-03：合并模式 3072 → 4096（超大选集内存尖峰）
+                GuestMemoryMb = ThunderMerged ? 6144 : 2048,   // 2026-10-03：合并模式 3072 → 4096 → 6144（为后续「桥多进程」预留）
                 // vCPU 按虚拟化方式分（2026-09-27 用户提出 x86 方案应吃更多核）：
                 // · aarch64 = TCG 软件模拟：2~4 峰值、>4 反而更慢（翻译块缓存与翻译锁全局共享，
                 //   12 vCPU 实测 0.78×）→ 保持 4，弱机按宿主核数收缩（QemuHostRuntime 默认语义）。

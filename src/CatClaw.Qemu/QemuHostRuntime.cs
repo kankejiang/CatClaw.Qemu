@@ -175,7 +175,7 @@ public sealed class QemuHostRuntime : IDisposable
     /// 怀疑是**解析超大选集那一刻的内存尖峰**把桥顶爆 ⇒ 先按最便宜的手段给足内存。
     /// 宿主 31.9GB 内存、当时可用 11.1GB，4096 有余量。</para>
     /// </summary>
-    public int GuestMemoryMbWithSwap { get; set; } = 4096;
+    public int GuestMemoryMbWithSwap { get; set; } = 6144;
 
     /// <summary>无 swap 时 <c>/thunder-data</c> 的 tmpfs 大小（MB）。</summary>
     public int DataDirMb { get; set; } = 3500;
