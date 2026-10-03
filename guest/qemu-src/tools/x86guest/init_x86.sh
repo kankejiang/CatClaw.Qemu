@@ -47,6 +47,18 @@ export CATCLAW_BCP="/system/javalib/core-oj.jar:/system/javalib/core-libart.jar:
 mkdir -p /binfmt_misc
 mount -t binfmt_misc none /binfmt_misc 2>/dev/null
 echo ':arm64_exe:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7::/system/bin/ndk_translation_program_runner_binfmt_misc_arm64:P' > /binfmt_misc/register 2>/dev/null && echo "[init] binfmt arm64 已注册" || echo "[init] binfmt 注册跳过"
+# ── 开机清理上次残留的 Go 代理进程（pvideo / moyu_go）──
+# 2026-10-03：网盘爬虫拉起 GoProxy 前会检查「是否已有实例」，残留进程会让它反复失败
+# 并经 ui-toast 弹「Go代理 N 进程仍在退出」（用户观感：老弹窗）；而它自己可能清不掉
+# （日志 detail=stale process cleanup incomplete）。开机先扫一遍，爬虫就能正常拉起。
+for _p in pvideo moyu_go goproxy; do
+    for _pid in $($BB pidof "$_p" 2>/dev/null); do
+        echo "[init] 清理残留 $_p pid=$_pid"
+        kill -9 "$_pid" 2>/dev/null
+    done
+done
+$BB rm -f /data/files/moyu_go/*.pid /data/local/tmp/*.pid 2>/dev/null
+
 LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $PORT &
 LP=$!
 while true; do
