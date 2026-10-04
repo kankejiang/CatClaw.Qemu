@@ -13,6 +13,38 @@ $BB mount -t devtmpfs devtmpfs /dev 2>/dev/null || $BB mount -t tmpfs tmpfs /dev
 for m in virtio_ring virtio virtio_pci_modern_dev virtio_pci_legacy_dev virtio_pci virtio_blk failover net_failover virtio_net binder_linux; do
     echo "[init] insmod $m: $($BB insmod /modules/$m.ko 2>&1)" || true
 done
+# ext4 持久数据盘要用的模块（2026-10-04 补回）：缺它们时下面的 mount -t ext4 会失败，
+# 于是 /data 退回 tmpfs ⇒ **网盘登录态每次重启都丢**（用户 2026-10-04 反馈）。
+# crc32c_generic 是 metadata_csum 的必需项；jbd2 是日志回放（QEMU 硬杀安全）所需。
+for m in crc32c_generic jbd2 mbcache ext4 binfmt_misc; do
+    [ -f /modules/$m.ko ] || continue
+    echo "[init] insmod $m: $($BB insmod /modules/$m.ko 2>&1)" || true
+done
+
+# ── 持久化数据盘（datadev=）：/data 落宿主本地 ext4——模拟器 userdata 同款（2026-10-02）──
+# 首启 mke2fs 建文件系统；之后每次挂载（ext4 日志自动重放，QEMU 硬杀安全）。
+# 盘上即最新状态：宿主的偏好回灌在 datadev 存在时由桥侧跳过（JavaSpiderRuntime）。
+PDD=$(getarg datadev)
+if [ -n "$PDD" ] && [ -b "$PDD" ]; then
+    echo "[persist] 盘节点: $PDD; 内核 ext4 支持: $(grep -c ext4 /proc/filesystems 2>/dev/null)（0=无!）; partitions:"; grep vdc /proc/partitions 2>/dev/null
+    export LD_LIBRARY_PATH=/system/lib64
+    export MKE2FS_CONFIG=/system/etc/mke2fs.conf
+    # ★ 预挂载强制 fsck（2026-10-03）：QEMU 硬杀可能留下脏 dentry（EUCLEAN，
+    #   "Structure needs cleaning"，rm/stat 都救不了），只有离线 e2fsck 能自愈。
+    #   幂等：干净盘上它秒过。不跑这步，jar 的"删旧→下载新"更新流程会卡死在脏目录上。
+    #   ⚠ 用 PATH 上的独立 e2fsck（e2fsprogs），busybox 无此 applet（"applet not found"）。
+    e2fsck -y "$PDD" > /tmp/fsck.log 2>&1
+    echo "[persist] 预挂载 fsck rc=$? 尾行: $($BB tail -1 /tmp/fsck.log 2>/dev/null)"
+    $BB mount -t ext4 "$PDD" /data
+    echo "[persist] mount RC=$?"
+    if ! $BB mount | $BB grep -q "on /data "; then
+        e2fsck -y "$PDD" >/dev/null 2>&1
+        $BB mount -t ext4 "$PDD" /data
+        echo "[persist] fsck 后 mount RC=$?"
+    fi
+else
+    echo "[persist] 无 datadev 或设备节点缺失（$PDD），/data 留在 tmpfs ⇒ **网盘登录态重启即丢**"
+fi
 
 PORT=$(getarg guardport); [ -n "$PORT" ] || PORT=18600
 # 多桥（2026-10-04）：bridges=N（默认 1）。同一个 VM 内并排起 N 个桥进程，端口 PORT+1..PORT+N-1，

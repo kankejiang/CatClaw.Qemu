@@ -144,6 +144,61 @@ public sealed class QemuArtGuest : IDisposable
     public bool IsUp => _sock is { Connected: true } && _vm is { IsRunning: true };
 
     /// <summary>
+    /// 多桥（2026-10-04）：连上第 <paramref name="bridgeIndex"/> 个桥，返回它的行列式传输流。
+    ///
+    /// <para>与 <see cref="ConnectAsync"/> 的区别：**不碰本实例的单连接状态**（<c>_sock/_w/_r</c>）——
+    /// 多桥模式下每个桥由调用方（宿主侧连接池）各自持有自己的流，任何一个桥断开都不影响其余；
+    /// 端口为 <c>BridgePort + bridgeIndex</c>（guest 的 /init 按 bridges=N 并排起在
+    /// GuardPort..GuardPort+N-1，QemuHostRuntime 已开好对应的 hostfwd）。</para>
+    ///
+    /// <para>前提：VM 已经在跑（本实例 <see cref="IsUp"/> 为真，或先经 ConnectAsync 拉起）——
+    /// 多桥是同一个 guest 里的多个进程，不需要额外的 VM。</para>
+    ///
+    /// <para>就绪判据与 ConnectAsync 一致：必须用一次真的 ping，slirp 自己就做三次握手，
+    /// guest 里还没 listen 也照样 connect 成功。</para>
+    /// </summary>
+    public async Task<(StreamWriter Stdin, StreamReader Stdout)?> ConnectBridgeAsync(int bridgeIndex)
+    {
+        if (bridgeIndex <= 0 || bridgeIndex >= Math.Max(1, BridgeCount)) return null;
+        if (!_vm?.IsRunning ?? true) return null;
+
+        // 副桥的**宿主**端口由 QemuHostRuntime.StartAsync 探测并记在 SideBridgePorts 里
+        // （guest 内仍是 GuardPort + index；不能直接用 BridgePort + index，那段可能已被
+        //  adb/GoProxy 隧道占用 → QEMU 起不来，见 QemuHostRuntime 里的说明）。
+        var port = _vm?.SideBridgePorts.FirstOrDefault(x => x.Guest == BridgePort + bridgeIndex).Host ?? 0;
+        if (port <= 0) return null;
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(45);
+        while (DateTime.UtcNow < deadline && !_disposed && (_vm?.IsRunning ?? false))
+        {
+            TcpClient? c = null;
+            try
+            {
+                c = new TcpClient { NoDelay = true };
+                using var connCts = new CancellationTokenSource(3000);
+                await c.ConnectAsync(IPAddress.Loopback, port, connCts.Token).ConfigureAwait(false);
+                var ns = c.GetStream();
+                var w = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true };
+                var r = new StreamReader(ns, Encoding.UTF8);
+                await w.WriteLineAsync("{\"id\":0,\"op\":\"ping\"}").ConfigureAwait(false);
+                using var readCts = new CancellationTokenSource(4000);
+                var line = await WaitForLineAsync(r, readCts.Token).ConfigureAwait(false);
+                if (line is not null && line.Contains("\"ok\""))
+                {
+                    Log($"桥 #{bridgeIndex} 就绪（127.0.0.1:{port}，探针应答 {line}）");
+                    c = null;           // 所有权移交给调用方 —— 置空，别在 finally 里把它关掉
+                    return (w, r);       //（否则刚交出去的流会被 finally 的 c.Dispose() 立刻关掉，
+                                          //  症状：副桥「就绪」后读循环立刻退出，2026-10-04 实测踩到）
+                }
+            }
+            catch { /* 该桥还没起来，换一次再试 */ }
+            finally { try { c?.Dispose(); } catch { } }
+            await Task.Delay(1500).ConfigureAwait(false);
+        }
+        Log($"桥 #{bridgeIndex} 在 45s 内未就绪（端口 {port}）");
+        return null;
+    }
+
+    /// <summary>
     /// 起 VM 并连上桥，返回桥的行列式传输流（宿主侧写请求 / 读响应）。
     /// 失败返回 null —— 调用方据此回落（宿主 JRE 那条路仍在）。
     /// </summary>

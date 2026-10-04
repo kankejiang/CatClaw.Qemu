@@ -50,6 +50,30 @@ public sealed class QemuHostRuntime : IDisposable
     /// </summary>
     public int BridgeCount { get; set; } = 1;
 
+    /// <summary>
+    /// 多桥各副桥的 hostfwd 映射（宿主端口 → guest 内的桥端口），StartAsync 里探测填好。
+    /// 宿主侧 <c>ConnectSideBridgesAsync</c> 按这个连；guest 内桥的端口是
+    /// <c>GuardPort + 1..N-1</c>（/init 的 bridges=N 决定的）。
+    /// </summary>
+    public List<(int Host, int Guest)> SideBridgePorts { get; } = new();
+
+    /// <summary>从 <paramref name="seed"/> 起向后找一个空闲回环端口（0 = 找不到）。</summary>
+    private static int PickFreePortNear(int seed)
+    {
+        for (var p = Math.Max(1024, seed); p < seed + 200; p++)
+        {
+            try
+            {
+                var l = new System.Net.Sockets.TcpListener(System.Net.IPAddress.Loopback, p);
+                l.Start();
+                l.Stop();
+                return p;
+            }
+            catch { /* 被占，换下一个 */ }
+        }
+        return 0;
+    }
+
     /// <summary>B1.0：adb 隧道端口（0 = 未开）。guest 里 adbd 由桥（Java）拉起并监听 5555，
     /// 宿主用 <c>adb connect 127.0.0.1:&lt;该端口&gt;</c> 直连进去排障。</summary>
     public int AdbPort { get; }
@@ -368,11 +392,20 @@ public sealed class QemuHostRuntime : IDisposable
             var netdev = $"user,id=n0,hostfwd=tcp:127.0.0.1:{MediaPort}-:20080";
             // Guard 解密服务：第二条 hostfwd（宿主与 guest 同号直连，桥进程经 127.0.0.1 调用）
             if (GuardPort > 0) netdev += $",hostfwd=tcp:127.0.0.1:{GuardPort}-:{GuardPort}";
-            // 多桥（2026-10-04）：桥 2..N 的 hostfwd。guest 的 /init 按 bridges=N 把桥起在
-            // GuardPort..GuardPort+N-1（同号直连，桥内自回调 proxy 用的也是同号，见 init）。
-            // 这里补齐剩下的 N-1 条转发，宿主侧 MultiBridge 才能连上第 2..N 个桥。
+            // 多桥（2026-10-04）：桥 2..N 的 hostfwd。
+            //
+            // ⚠ 端口**不能**用 GuardPort+k 直接推：QemuArtGuest 是按 PickFreePort 逐个挑空闲端口的
+            // （MediaPort/Adb/GoProxy 等都可能落在那段区间里），实测推出来的 GuardPort+1..N-1
+            // 已被 adb 隧道占用 → QEMU 报 "Could not set up host forwarding rule" 并**直接退出**。
+            // 正确做法：这里现场探测一段空闲端口，并让 QemuArtGuest 用同一组端口。
+            SideBridgePorts.Clear();
             for (var k = 1; k < BridgeCount; k++)
-                netdev += $",hostfwd=tcp:127.0.0.1:{GuardPort + k}-:{GuardPort + k}";
+            {
+                var host = PickFreePortNear(GuardPort + 40 + k * 4);
+                if (host <= 0) continue;
+                SideBridgePorts.Add((Host: host, Guest: GuardPort + k));
+                netdev += $",hostfwd=tcp:127.0.0.1:{host}-:{GuardPort + k}";
+            }
             // 爬虫自带 /proxy 服务的隧道（ART guest）
             if (ProxyTunnel is { } pt) netdev += $",hostfwd=tcp:127.0.0.1:{pt.Host}-:{pt.Guest}";
             // GoProxy（pvideo，guest 5266）流隧道：pvideo 只绑 127.0.0.1，slirp 从 eth0 进来

@@ -119,6 +119,14 @@ for m in virtio_ring virtio virtio_pci_modern_dev virtio_pci_legacy_dev virtio_p
     src=$(find $W/linux-data/lib/modules/6.1.0-50-amd64 -name "$m.ko" 2>/dev/null | head -1)
     [ -n "$src" ] && cp "$src" $R/modules/ && echo "模块: $m"
 done
+# 2026-10-04：持久数据盘（datadev=）要挂 ext4，此前**清单里没有这些模块** ⇒
+#   mount -t ext4 失败 ⇒ /data 退回 tmpfs ⇒ **网盘登录态每次重启都丢**（用户 2026-10-04 反馈）。
+#   内核本体不含 ext4（/proc/filesystems 实测为 0），必须把模块带进 initrd。
+#   crc32c_generic 是 metadata_csum 必需项；jbd2 是日志回放（QEMU 硬杀安全）；mbcache 是缓冲缓存。
+for m in crc32c_generic jbd2 mbcache ext4; do
+    src=$(find $W/linux-data/lib/modules/6.1.0-50-amd64 -name "$m.ko*" 2>/dev/null | head -1)
+    [ -n "$src" ] && cp "$src" $R/modules/ && echo "模块(持久盘): $m"
+done
 
 # ── 4. /init 与 /linkerconfig/ld.config.txt ──
 cp $W/init_x86.sh $R/init

@@ -268,6 +268,30 @@ public class Server {
                         yield "dumped " + Thread.getAllStackTraces().size() + " threads";
                     }
                     case "ping" -> "pong";
+      // 2026-10-04：回报 /data 的**真实**挂载类型，供宿主决定是否跳过偏好回灌。
+      //   起因：宿主只看「有没有传 datadev 参数」就以为持久了，但该定制内核不带 ext4 驱动，
+      //   mount -t ext4 /dev/vdc /data 实际失败（串口日志 mount RC=255），/data 仍是 tmpfs ⇒
+      //   既没盘也没回灌 ⇒ 网盘登录态每次重启必丢。宿主据此 op 得到真实答案。
+      case "guestdata-persist" -> {
+        boolean persistent = false;
+        String detail = "";
+        try {
+          String fs = "";
+          try (java.io.BufferedReader rd = new java.io.BufferedReader(new java.io.FileReader("/proc/mounts"))) {
+            String ln;
+            while ((ln = rd.readLine()) != null) {
+              String[] f = ln.split(" ");
+              if (f.length >= 3 && f[1].equals("/data")) { fs = f[2]; break; }
+            }
+          } catch (Throwable ignore) { }
+          detail = "fs=" + fs;
+          // tmpfs / ramfs / rootfs 都随 VM 冷启清空 ⇒ 不持久
+          persistent = !fs.isEmpty() && !fs.equals("tmpfs") && !fs.equals("ramfs");
+        } catch (Throwable t) {
+          detail = "probe-failed: " + t.getClass().getSimpleName();
+        }
+        yield new JSONObject().put("persistent", persistent).put("detail", detail).toString();
+      }
                     case "cookies" -> {
                         // 2026-10-02 网盘登录态排障（CATCLAW_BRIDGE_DEBUG 泵用，只读）：
                         // ① java.net.CookieHandler 默认层 ② android.webkit 真框架 CookieManager
