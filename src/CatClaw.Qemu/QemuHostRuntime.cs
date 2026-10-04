@@ -397,22 +397,24 @@ public sealed class QemuHostRuntime : IDisposable
                 //   X86_64 = -M q35 -cpu max + WHPX 硬件虚拟化优先（Windows 原生虚拟化平台，
                 //     接近原生速度），QEMU 多 -accel 依次尝试：whpx 不可用自动落 tcg。
                 "-M", Arch == GuestArch.X86_64 ? "q35" : "virt",
-                // 2026-10-03：x86 由 -cpu max 改为 -cpu host。
-                //   max = 向 guest 暴露「所有可能的 CPU 特性」（含 SVE/SME 等），QEMU 必须逐条模拟；
-                //   host = 直接用宿主 CPU 特性（WHPX 下这本就是硬件虚拟化的常态），少一层模拟开销。
-                //   本项目 aarch64 侧已因 max 打开 SVE 而让 TCG 慢 22%（见上方注释），x86 侧同理。
-                //   CATCLAW_CPU 可回退（排障用）：-p 无入口，故走环境变量。
+                // 2026-10-04 回退：-cpu host → **-cpu max**。
+                //   曾在 10-04 改成 host（本机是 WHPX，理论上该直通宿主特性），但实测**不稳定**：
+                //   QEMU 反复报 "failed to get xsave state"，guest 随之反复重启，桥刚起就断
+                //   （搜索只跑完 20 余个站点就停）。max 虽多一层特性模拟，但稳定。
+                //   如需再试 host，置 CATCLAW_CPU=host 后实测确认稳定再用。
                 "-cpu", Arch == GuestArch.X86_64
-                    ? (Environment.GetEnvironmentVariable("CATCLAW_CPU") is { Length: > 0 } c ? c : "host")
+                    ? (Environment.GetEnvironmentVariable("CATCLAW_CPU") is { Length: > 0 } c ? c : "max")
                     : "cortex-a76",
                 "-m", memMb.ToString(), "-smp", SmpCount.ToString(), "-nographic",
                 // 2026-10-03：WHPX 加速器补 kernel-irqchip=off —— 免掉内核态 irqchip 模拟，减少 VM exit。
                 //   CATCLAW_ACCEL_OPTS 可追加/回退（例如 "kernel-irqchip=on"）。
-                // 2026-10-04：WHPX 默认补 kernel-irqchip=off —— 免掉内核态 irqchip 模拟、减少 VM exit。
-                //   CATCLAW_ACCEL_OPTS 可追加其它选项，或整条回退（例如设成 "kernel-irqchip=on"）。
+                // 2026-10-04 回退：曾给 WHPX 默认加 kernel-irqchip=off，实测**引入不稳定** ——
+                //   QEMU 反复报 "failed to get xsave state"，guest 随之反复重启，桥刚起就断
+                //   （实测搜索只跑完 20 余个站点）。已去掉该默认项，恢复为纯 whpx。
+                //   如需再试，置 CATCLAW_ACCEL_OPTS=kernel-irqchip=off 后实测确认稳定再用。
                 "-accel", Arch == GuestArch.X86_64
                     ? (string.IsNullOrWhiteSpace(accelOverride)
-                        ? "whpx" + (Environment.GetEnvironmentVariable("CATCLAW_ACCEL_OPTS") is { Length: > 0 } accelOpts ? "," + accelOpts : ",kernel-irqchip=off")
+                        ? "whpx" + (Environment.GetEnvironmentVariable("CATCLAW_ACCEL_OPTS") is { Length: > 0 } accelOpts ? "," + accelOpts : "")
                         : accelOverride)
                     : "tcg,tb-size=256,split-wx=off",
                 "-L", "share",
@@ -493,6 +495,11 @@ public sealed class QemuHostRuntime : IDisposable
             if (PersistStore is not null) append += $" datadev=/dev/vd{(char)('a' + vdIndex++)}";
             // Guard VM 的口令与启动磁力经 cmdline 覆盖（/init 的 getarg；缺省与旧行为一致）
             if (CtrlPort > 0) append += $" ctrl={CtrlPort}";
+            // 桥自检：CATCLAW_BRIDGE_SELFTEST=<秒> → guest 的 /init 在桥起来该秒数后自杀一次，
+            // 用于端到端验证「/init 监督器会原地重启桥、VM 不重启」（2026-10-04）。
+            if (int.TryParse(Environment.GetEnvironmentVariable("CATCLAW_BRIDGE_SELFTEST"), out var st)
+                && st is > 0 and <= 600)
+                append += $" selftest={st}";
             if (GuardPort > 0) append += $" guardport={GuardPort}";
             // 合并 guest 模式：ART initrd 的迅雷段据此拉起 harness（见 QemuArtGuest.ThunderMerged）
             if (ThunderPort > 0) append += $" thunderport={ThunderPort}";

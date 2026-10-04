@@ -70,9 +70,19 @@ $BB rm -f /data/files/moyu_go/*.pid /data/local/tmp/*.pid 2>/dev/null
 #   日志一律打 [init]，宿主侧 slirp 日志转发会收走（见 QemuHostRuntime）。
 RESTART_MAX=5
 try_n=0
+# 自检（2026-10-04）：内核 cmdline 带 selftest=N 时，桥起来 N 秒后自杀一次，
+# 用来端到端验证「监督器确实会原地重启桥、VM 不重启」。宿主经 -append 传入，默认关。
+SELFTEST=$(getarg selftest)
 while true; do
     LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $PORT &
     LP=$!
+    if [ -n "$SELFTEST" ] && [ "$try_n" -eq 0 ]; then
+        (
+            $BB sleep "$SELFTEST"
+            echo "[init] 自检：主动杀掉桥 pid=$LP（验证监督器重启）"
+            kill -9 $LP 2>/dev/null
+        ) &
+    fi
     # 等桥退出：轮询 kill -0（更稳），再 wait 取退出码
     while $BB kill -0 $LP 2>/dev/null; do
         $BB sleep 5
