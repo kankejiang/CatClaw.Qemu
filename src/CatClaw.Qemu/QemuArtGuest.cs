@@ -57,6 +57,16 @@ public sealed class QemuArtGuest : IDisposable
     /// <summary>本 guest 的桥端口（未启动为 0）。日志与排障用。</summary>
     public int BridgePort { get; private set; }
 
+    /// <summary>
+    /// 同一 VM 内并排起的桥进程数（2026-10-04，默认 1，来自环境变量 <c>CATCLAW_BRIDGES</c>，取 2..8）。
+    /// &gt;1 时端口为 <see cref="BridgePort"/>..+N-1，每个桥是独立的 ART 虚拟机与 jar 缓存；
+    /// 目的是绕开「桥内逐站串行」使不同站点真正并行，并提高可靠性（一个桥崩不影响其余）。
+    /// </summary>
+    public int BridgeCount { get; private set; } = 1;
+
+    /// <summary>各桥的宿主端口（长度 = <see cref="BridgeCount"/>）：宿主侧多桥连接池用。</summary>
+    public int[] BridgePorts => Enumerable.Range(BridgePort, Math.Max(1, BridgeCount)).ToArray();
+
     /// <summary>guest 里爬虫自带 /proxy 服务的端口（桥的 Art.serveProxy 绑的就是它，TVBox 惯例）。</summary>
     public const int GuestProxyPort = 9978;
 
@@ -239,6 +249,13 @@ public sealed class QemuArtGuest : IDisposable
         if (_vm is null)
         {
             var bridge = PickFreePort(PortSeed);
+            // 多桥（2026-10-04）：CATCLAW_BRIDGES=2..8 → 同一 VM 内并排起 N 个桥，
+            // 端口 bridge..bridge+N-1（hostfwd 与 init 的 bridges= 由 QemuHostRuntime 处理）。
+            var bridgeCount = 1;
+            if (int.TryParse(Environment.GetEnvironmentVariable("CATCLAW_BRIDGES"), out var nb)
+                && nb is > 1 and <= 8)
+                bridgeCount = nb;
+            BridgeCount = bridgeCount;
             var media = PickFreePort(bridge + 1);       // QemuHostRuntime 总要一条 -:20080 的 hostfwd，别撞号
             // 爬虫的播放地址写的是它自己那个 /proxy（guest 里的 9978），给它开一条宿主隧道。
             var tunnel = PickFreePort(media + 1);
@@ -312,7 +329,8 @@ public sealed class QemuArtGuest : IDisposable
                 NetDevice = GuestArch == GuestArch.X86_64
                     ? "virtio-net-pci,netdev=n0"
                     : "virtio-net-device,netdev=n0",
-                ProxyTunnel = tunnel > 0 ? (tunnel, GuestProxyPort) : null,
+                BridgeCount = BridgeCount,      // 多桥：让 HostRuntime 补出第 2..N 条 hostfwd
+            ProxyTunnel = tunnel > 0 ? (tunnel, GuestProxyPort) : null,
                 GoProxyTunnel = gofwd > 0 ? (gofwd, 25266) : null,
             };
             // 合并模式：给迅雷引擎建租约（媒体口 / 数据盘 / swap 全租用；VM 生命周期仍归本类）。

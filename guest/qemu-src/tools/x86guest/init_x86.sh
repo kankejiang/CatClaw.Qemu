@@ -15,6 +15,13 @@ for m in virtio_ring virtio virtio_pci_modern_dev virtio_pci_legacy_dev virtio_p
 done
 
 PORT=$(getarg guardport); [ -n "$PORT" ] || PORT=18600
+# 多桥（2026-10-04）：bridges=N（默认 1）。同一个 VM 内并排起 N 个桥进程，端口 PORT+1..PORT+N-1，
+# 每个桥各自持有独立的 ART 虚拟机与 jar 缓存 ⇒ 不同站点的 load/search **真正并行**
+# （单桥时 Server.call 按 synchronized(SITE_LOCKS[…]) 逐站串行，96 个站的 load 只能一个个排队）。
+# 宿主侧按轮转把站点分给各桥（见 CatClawVideo 的 MultiBridge 调度）。
+NBRIDGE=$(getarg bridges); [ -n "$NBRIDGE" ] || NBRIDGE=1
+[ "$NBRIDGE" -ge 1 ] 2>/dev/null || NBRIDGE=1
+[ "$NBRIDGE" -le 8 ] 2>/dev/null || NBRIDGE=8
 DP=$(getarg ctrl)
 if [ -n "$DP" ]; then export CATCLAW_DNS=10.0.2.2:$DP; echo "[dns] 走宿主转发 $CATCLAW_DNS"; fi
 echo "=== CatClaw x86 ART guest begin (bridgeport=$PORT) ==="
@@ -68,35 +75,59 @@ $BB rm -f /data/files/moyu_go/*.pid /data/local/tmp/*.pid 2>/dev/null
 # 重启策略：指数退避 2s→4s→… 封顶 30s；连续失败超过 RESTART_MAX 次后拉长到 60s，
 #   避免「桥一启动就崩」时忙等（那属于环境问题，重启无用，退避让 CPU 留给别的进程）。
 #   日志一律打 [init]，宿主侧 slirp 日志转发会收走（见 QemuHostRuntime）。
+# ── 桥进程监督器（2026-10-04 重写；同日扩展为多桥）──
+#
+# 旧实现：桥一死就 break 出去 sleep 3600 空转，等宿主杀 VM 重来（~20s，期间所有 jar 源全灭）。
+# 新实现：**桥死就在本机原地重启**，VM 与 /data（持久盘上的网盘 Cookie / 登录态）都不动。
+#   实测崩因是 ART JIT 代码里的空指针（[sig] s=11 a=0 … /memfd:jit-cache），进程级
+#   SIGSEGV，try/catch 拦不住；重启桥是唯一能在本机自救的手段。
+#
+# 多桥（bridges=N）：并排起 N 个桥，端口 PORT..PORT+N-1，各持独立 ART 虚拟机与 jar 缓存。
+#   单桥时桥内 Server.call 按 synchronized(SITE_LOCKS[…]) **逐站串行**，
+#   96 个站的 load（实测 0.7~3s/站）只能排队 ⇒ 搜索跑不完；多桥让不同站点真正并行。
+#   每个桥是独立监督循环：一个崩了只重启它自己，其余照常服务。
+#
+# 重启策略：指数退避 2s→4s→… 封顶 30s；连续失败超过 RESTART_MAX 次后拉长到 60s。
+#   日志一律打 [init]，宿主侧 slirp 日志转发会收走（见 QemuHostRuntime）。
 RESTART_MAX=5
-try_n=0
-# 自检（2026-10-04）：内核 cmdline 带 selftest=N 时，桥起来 N 秒后自杀一次，
-# 用来端到端验证「监督器确实会原地重启桥、VM 不重启」。宿主经 -append 传入，默认关。
 SELFTEST=$(getarg selftest)
-while true; do
-    LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $PORT &
-    LP=$!
-    if [ -n "$SELFTEST" ] && [ "$try_n" -eq 0 ]; then
-        (
-            $BB sleep "$SELFTEST"
-            echo "[init] 自检：主动杀掉桥 pid=$LP（验证监督器重启）"
-            kill -9 $LP 2>/dev/null
-        ) &
-    fi
-    # 等桥退出：轮询 kill -0（更稳），再 wait 取退出码
-    while $BB kill -0 $LP 2>/dev/null; do
-        $BB sleep 5
-    done
-    wait $LP 2>/dev/null
-    RC=$?
-    try_n=$((try_n + 1))
-    if [ $try_n -ge $RESTART_MAX ]; then
-        DELAY=60
-    else
-        DELAY=$((2 << (try_n - 1)))
-        if [ $DELAY -gt 30 ]; then DELAY=30; fi
-    fi
-    echo "[init] 桥进程已退出，退出码=$RC（139=SIGSEGV 132=SIGILL 134=SIGABRT 137=SIGKILL 0/1=主动退出）"
-    echo "[init] ${DELAY}s 后重启桥（连续第 $try_n 次）—— VM 与 /data 不动，网盘登录态保留"
-    $BB sleep $DELAY
+
+i=0
+while [ $i -lt $NBRIDGE ]; do
+    BP=$((PORT + i))
+    (
+        try_n=0
+        while true; do
+            LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $BP &
+            LP=$!
+            if [ -n "$SELFTEST" ] && [ "$i" -eq 0 ] && [ $try_n -eq 0 ]; then
+                (
+                    $BB sleep "$SELFTEST"
+                    echo "[init] 自检：主动杀掉桥 pid=$LP（验证监督器重启）"
+                    kill -9 $LP 2>/dev/null
+                ) &
+            fi
+            # 等桥退出：轮询 kill -0（比 wait 稳），再 wait 取退出码
+            while $BB kill -0 $LP 2>/dev/null; do
+                $BB sleep 5
+            done
+            wait $LP 2>/dev/null
+            RC=$?
+            try_n=$((try_n + 1))
+            if [ $try_n -ge $RESTART_MAX ]; then
+                DELAY=60
+            else
+                DELAY=$((2 << (try_n - 1)))
+                if [ $DELAY -gt 30 ]; then DELAY=30; fi
+            fi
+            echo "[init] 桥($BP) 进程已退出，退出码=$RC（139=SIGSEGV 132=SIGILL 134=SIGABRT 137=SIGKILL 0/1=主动退出）"
+            echo "[init] ${DELAY}s 后重启桥($BP)（连续第 $try_n 次）—— VM 与 /data 不动，网盘登录态保留"
+            $BB sleep $DELAY
+        done
+    ) &
+    # 错开启动：各桥的 ART 初始化很吃 CPU/内存，同时起会互相拖慢
+    $BB sleep 8
+    i=$((i + 1))
 done
+echo "[init] 已拉起 $NBRIDGE 个桥：端口 $PORT..$((PORT + NBRIDGE - 1))"
+while true; do $BB sleep 3600; done

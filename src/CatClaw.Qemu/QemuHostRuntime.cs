@@ -39,6 +39,17 @@ public sealed class QemuHostRuntime : IDisposable
     /// <summary>Guard 解密服务端口（0 = 未启用；guest 监听 + 宿主 hostfwd 同号）。</summary>
     public int GuardPort { get; }
 
+    /// <summary>
+    /// 同一 VM 内并排起的桥进程数（2026-10-04，默认 1）。
+    /// &gt;1 时 guest 的 /init 会起 N 个桥，端口 <see cref="GuardPort"/>..+N-1，
+    /// 宿主侧同步开 N 条 hostfwd；每个桥是独立的 ART 虚拟机与 jar 缓存。
+    /// 目的：桥内 <c>Server.call</c> 按 <c>synchronized(SITE_LOCKS[…])</c> **逐站串行**，
+    /// 96 个站的 load（实测 0.7~3s/站）只能排队；多桥让不同站点真正并行，也提高可靠性
+    /// （一个桥 SIGSEGV 只影响它自己，其余照常服务）。
+    /// 环境变量 <c>CATCLAW_BRIDGES=2..8</c> 开启，默认关。
+    /// </summary>
+    public int BridgeCount { get; set; } = 1;
+
     /// <summary>B1.0：adb 隧道端口（0 = 未开）。guest 里 adbd 由桥（Java）拉起并监听 5555，
     /// 宿主用 <c>adb connect 127.0.0.1:&lt;该端口&gt;</c> 直连进去排障。</summary>
     public int AdbPort { get; }
@@ -357,6 +368,11 @@ public sealed class QemuHostRuntime : IDisposable
             var netdev = $"user,id=n0,hostfwd=tcp:127.0.0.1:{MediaPort}-:20080";
             // Guard 解密服务：第二条 hostfwd（宿主与 guest 同号直连，桥进程经 127.0.0.1 调用）
             if (GuardPort > 0) netdev += $",hostfwd=tcp:127.0.0.1:{GuardPort}-:{GuardPort}";
+            // 多桥（2026-10-04）：桥 2..N 的 hostfwd。guest 的 /init 按 bridges=N 把桥起在
+            // GuardPort..GuardPort+N-1（同号直连，桥内自回调 proxy 用的也是同号，见 init）。
+            // 这里补齐剩下的 N-1 条转发，宿主侧 MultiBridge 才能连上第 2..N 个桥。
+            for (var k = 1; k < BridgeCount; k++)
+                netdev += $",hostfwd=tcp:127.0.0.1:{GuardPort + k}-:{GuardPort + k}";
             // 爬虫自带 /proxy 服务的隧道（ART guest）
             if (ProxyTunnel is { } pt) netdev += $",hostfwd=tcp:127.0.0.1:{pt.Host}-:{pt.Guest}";
             // GoProxy（pvideo，guest 5266）流隧道：pvideo 只绑 127.0.0.1，slirp 从 eth0 进来
@@ -500,6 +516,12 @@ public sealed class QemuHostRuntime : IDisposable
             if (int.TryParse(Environment.GetEnvironmentVariable("CATCLAW_BRIDGE_SELFTEST"), out var st)
                 && st is > 0 and <= 600)
                 append += $" selftest={st}";
+            // 多桥（2026-10-04）：bridges=N —— guest 的 /init 在同一 VM 里并排起 N 个桥进程，
+            // 端口 GuardPort..GuardPort+N-1（hostfwd 已在 QemuArtGuest 侧按 N 条转发，见那里）。
+            // 目的是让不同站点的 load/search **真正并行**（单桥内是逐站串行的 synchronized）。
+            if (int.TryParse(Environment.GetEnvironmentVariable("CATCLAW_BRIDGES"), out var nb)
+                && nb is > 1 and <= 8)
+                append += $" bridges={nb}";
             if (GuardPort > 0) append += $" guardport={GuardPort}";
             // 合并 guest 模式：ART initrd 的迅雷段据此拉起 harness（见 QemuArtGuest.ThunderMerged）
             if (ThunderPort > 0) append += $" thunderport={ThunderPort}";
