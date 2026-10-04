@@ -58,16 +58,35 @@ for _p in pvideo moyu_go goproxy; do
     done
 done
 $BB rm -f /data/files/moyu_go/*.pid /data/local/tmp/*.pid 2>/dev/null
-
-LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $PORT &
-LP=$!
+# ── 桥进程监督器（2026-10-04 重写）──
+#
+# 旧实现：桥一死就 break 出去 sleep 3600 空转，等宿主杀 VM 重来（~20s，期间所有 jar 源全灭）。
+# 新实现：**桥死就在本机原地重启**，VM 与 /data（持久盘上的网盘 Cookie / 登录态）都不动。
+#   实测崩因是 ART JIT 代码里的空指针（[sig] s=11 a=0 … /memfd:jit-cache），进程级
+#   SIGSEGV，try/catch 拦不住；重启桥是唯一能在本机自救的手段。
+#
+# 重启策略：指数退避 2s→4s→… 封顶 30s；连续失败超过 RESTART_MAX 次后拉长到 60s，
+#   避免「桥一启动就崩」时忙等（那属于环境问题，重启无用，退避让 CPU 留给别的进程）。
+#   日志一律打 [init]，宿主侧 slirp 日志转发会收走（见 QemuHostRuntime）。
+RESTART_MAX=5
+try_n=0
 while true; do
-    if ! $BB kill -0 $LP 2>/dev/null; then
-        wait $LP
-        RC=$?
-        echo "[init] 桥进程已退出，退出码=$RC（139=SIGSEGV 132=SIGILL 134=SIGABRT 137=SIGKILL 0/1=主动退出）"
-        break
+    LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $PORT &
+    LP=$!
+    # 等桥退出：轮询 kill -0（更稳），再 wait 取退出码
+    while $BB kill -0 $LP 2>/dev/null; do
+        $BB sleep 5
+    done
+    wait $LP 2>/dev/null
+    RC=$?
+    try_n=$((try_n + 1))
+    if [ $try_n -ge $RESTART_MAX ]; then
+        DELAY=60
+    else
+        DELAY=$((2 << (try_n - 1)))
+        if [ $DELAY -gt 30 ]; then DELAY=30; fi
     fi
-    $BB sleep 5
+    echo "[init] 桥进程已退出，退出码=$RC（139=SIGSEGV 132=SIGILL 134=SIGABRT 137=SIGKILL 0/1=主动退出）"
+    echo "[init] ${DELAY}s 后重启桥（连续第 $try_n 次）—— VM 与 /data 不动，网盘登录态保留"
+    $BB sleep $DELAY
 done
-while true; do $BB sleep 3600; done
