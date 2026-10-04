@@ -259,12 +259,25 @@ public class Server {
                         // 宿主回灌持久化文件（网盘 Cookie 的 sharedb）：guest /data 是 tmpfs，
                         // VM 冷启即清，握手后把上次会话保存的文件写回来。路径白名单防任意写。
                         String p = req.optString("path", "");
-                        // 2026-10-04：回灌白名单同步放宽到 /data/catclaw/shared_prefs/（Cookie 的真实位置，
-            // 见 sharedbSync 的路径修正注释）。旧路径保留兼容。
-            if ((!p.startsWith("/data/cache/sharedb/") && !p.startsWith("/data/catclaw/shared_prefs/"))
-                || p.contains(".."))
-                            throw new IllegalArgumentException("writefile: path 不在白名单");
-                        byte[] data = java.util.Base64.getDecoder().decode(req.optString("data", ""));
+                        // 白名单由 sharedbDir() 派生（唯一真源）+ 旧路径兼容，不再手写路径串。
+                        String allowDir = sharedbDir().getAbsolutePath() + "/";
+                        if ((!p.startsWith(allowDir) && !p.startsWith("/data/cache/sharedb/"))
+                                || p.contains(".."))
+                            throw new IllegalArgumentException(
+                                    "writefile: path 不在白名单（允许 " + allowDir + "）");
+                        // ⚠ 2026-10-04：字段名与宿主侧 JavaSpiderRuntime 的 writefile 发送端对齐
+                        //   （宿主发的是 "data"，见该文件 ["data"] = b64）。曾因读写字段名不一致
+                        //   导致**静默写 0 字节**且仍回 "ok" —— 很难察觉。
+                        //   这里同时接受 data / b64，并在都缺失时报错（而不是默默写空文件）。
+                        String b64 = req.optString("data", "");
+                        if (b64.isEmpty()) b64 = req.optString("b64", "");
+                        if (b64.isEmpty()) throw new IllegalArgumentException("writefile: 缺少 data/b64 内容");
+                        byte[] data;
+                        try {
+                            data = java.util.Base64.getDecoder().decode(b64);
+                        } catch (IllegalArgumentException bad) {
+                            throw new IllegalArgumentException("writefile: 内容不是合法 base64（" + bad.getMessage() + "）");
+                        }
                         java.io.File f = new java.io.File(p);
                         java.io.File parent = f.getParentFile();
                         if (parent != null && !parent.exists()) parent.mkdirs();
@@ -720,22 +733,13 @@ public class Server {
                         int slash = pn.lastIndexOf('/');
                         if (slash >= 0) pn = pn.substring(slash + 1);
                         if (pn.isEmpty()) pn = "default";
-                        // 2026-10-04 修正（实测 find-cookie）：System.getProperty("data.dir") 在 ART 里**未设置**，
-                        // 于是退回相对路径 "data" ⇒ 实际写到 <cwd>/data/shared_prefs = /data/shared_prefs，
-                        // 而壳读的是 /data/catclaw/shared_prefs（ANDROID_DATA=/data + data.dir=/data/catclaw）。
-                        // 结果：**回灌一直在成功执行、宿主日志也报「回灌 ok」，但壳永远读不到** ⇒
-                        //   网盘登录态每次 VM 重启即丢（用户 2026-10-04 反馈，绕了几轮才定位到这里）。
-                        // 现在：优先用 ART 实际的 data.dir（形如 /data/catclaw），缺失则退回
-                        //   宿主环境变量 ANDROID_DATA=/data 下的既有约定，最后才是 /data。
-                        String dataDir = System.getProperty("data.dir");
-                        java.io.File dir;
-                        if (dataDir != null && dataDir.startsWith("/")) {
-                            dir = new java.io.File(dataDir, "shared_prefs");
-                        } else {
-                            String envData = System.getenv("ANDROID_DATA");
-                            dir = new java.io.File((envData != null && !envData.isEmpty() ? envData : "/data")
-                                    + "/catclaw", "shared_prefs");
-                        }
+                        // 2026-10-04 修正（实测 find-cookie）：原实现是
+                        //   new File(System.getProperty("data.dir", "data"), "shared_prefs")
+                        // ART 里**未设置** data.dir 系统属性 ⇒ 退回相对路径 "data" ⇒ 实际写到
+                        // /data/shared_prefs，而壳读的是 /data/catclaw/shared_prefs
+                        // ⇒ **回灌报 ok 但壳永远读不到** ⇒ 登录态每次重启即丢。
+                        // 现在统一走 sharedbDir()，与上行同步、writefile 白名单同源。
+                        java.io.File dir = sharedbDir();
                         if (!dir.isDirectory()) dir.mkdirs();
                         System.err.println("[prefs] 回灌落点 " + dir.getAbsolutePath());
                         java.nio.file.Files.write(new java.io.File(dir, pn + ".xml").toPath(),
@@ -1235,6 +1239,21 @@ public class Server {
     private static volatile String sharedbKey;
 
     /**
+     * shared_prefs 目录的唯一真源（2026-10-04）。
+     *
+     * <p>实测（桥 op=find-cookie）：壳把网盘 Cookie 写在 {@code /data/catclaw/shared_prefs}
+     * —— 与 {@code ANDROID_DATA=/data} 且 ART 的 {@code data.dir=/data/catclaw} 一致。
+     * 早前代码三处各写各的路径（上行扫 /data/cache/sharedb、下行写 /data/cache/sharedb、
+     * prefsput 写 /data/shared_prefs），三处互不一致，导致「回灌报 ok 但壳读不到」。
+     *
+     * <p>现在统一到这里：{@link #sharedbSync()} 上行、prefsput 下行、writefile 白名单
+     * 共用同一目录定义，杜绝再次跑偏。
+     */
+    private static java.io.File sharedbDir() {
+        return new java.io.File("/data/catclaw/shared_prefs");
+    }
+
+    /**
      * 网盘 Cookie 等持久化文件的同步（2026-10-02）：{@code /data/cache/sharedb/config.db}
      * 是 FishConfig 存夸克/GitHub Cookie 的地方，而 guest /data 是 tmpfs——VM 冷启即清，
      * 登录态跟着丢（用户实测「重启后登入状态消失」）。宿主偏好链（prefs-sync）只覆盖
@@ -1248,9 +1267,13 @@ public class Server {
             //   （guazi_auth.xml 718B / spUtils.xml 404B / pan_sort.xml …，与 ANDROID_DATA=/data
             //   且 ART data.dir=/data/catclaw 一致）。原路径按旧壳写死 ⇒ sharedbSync 永远
             //   「目录不存在」，桥从不发 file-sync，宿主 guest-prefssharedb 从未被创建。
-            //   现在：旧路径优先（仍兼容用旧壳的源），不存在则用 /data/catclaw/shared_prefs。
-            java.io.File dir = new java.io.File("/data/cache/sharedb");
-            if (!dir.isDirectory()) dir = new java.io.File("/data/catclaw/shared_prefs");
+            //
+            //   ⚠ 上下行必须同源：上行扫什么目录，宿主回灌就得写回同一目录。修之前上行优先
+            //   /data/cache/sharedb、下行硬编码同一路径，看似对称；但桥侧 writefile 白名单里
+            //   两个路径都放行，一旦 guest 里 /data/cache/sharedb 被创建（回灌自己建的），
+            //   上行就会改扫这个**空壳目录**，而壳真正读的 /data/catclaw/shared_prefs 被忽略
+            //   ⇒ Cookie 上行为空、下行写空处，永远不闭环。现统一走 sharedbDir()。
+            java.io.File dir = sharedbDir();
             java.io.File[] fs = dir.listFiles();
             StringBuilder key = new StringBuilder();
             org.json.JSONArray files = new org.json.JSONArray();
