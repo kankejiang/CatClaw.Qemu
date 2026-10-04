@@ -259,7 +259,10 @@ public class Server {
                         // 宿主回灌持久化文件（网盘 Cookie 的 sharedb）：guest /data 是 tmpfs，
                         // VM 冷启即清，握手后把上次会话保存的文件写回来。路径白名单防任意写。
                         String p = req.optString("path", "");
-                        if (!p.startsWith("/data/cache/sharedb/") || p.contains(".."))
+                        // 2026-10-04：回灌白名单同步放宽到 /data/catclaw/shared_prefs/（Cookie 的真实位置，
+            // 见 sharedbSync 的路径修正注释）。旧路径保留兼容。
+            if ((!p.startsWith("/data/cache/sharedb/") && !p.startsWith("/data/catclaw/shared_prefs/"))
+                || p.contains(".."))
                             throw new IllegalArgumentException("writefile: path 不在白名单");
                         byte[] data = java.util.Base64.getDecoder().decode(req.optString("data", ""));
                         java.io.File f = new java.io.File(p);
@@ -287,6 +290,42 @@ public class Server {
       //   起因：宿主只看「有没有传 datadev 参数」就以为持久了，但该定制内核不带 ext4 驱动，
       //   mount -t ext4 /dev/vdc /data 实际失败（串口日志 mount RC=255），/data 仍是 tmpfs ⇒
       //   既没盘也没回灌 ⇒ 网盘登录态每次重启必丢。宿主据此 op 得到真实答案。
+      // 2026-10-04 诊断：网盘 Cookie 到底落在 guest 的哪个路径。
+      // 起因：sharedb 定时同步显示「目录不存在（/data/cache/sharedb）」，宿主因此永远拿不到
+      // config.db，VM 重启登录态即丢（用户 2026-10-04 反馈）。这个 op 把 /data 下所有
+      // 疑似落点（cache/shared_prefs/files/fishso 及其大小 mtime）列出来，供宿主定位。
+      case "find-cookie" -> {
+        StringBuilder sb = new StringBuilder();
+        String[] roots = { "/data/cache", "/data/shared_prefs", "/data/files", "/data/fishso",
+                           "/data/local/tmp", "/data/catclaw" };
+        for (String root : roots) {
+          java.io.File d = new java.io.File(root);
+          if (!d.exists()) { sb.append(root).append(" = <不存在>\n"); continue; }
+          sb.append(root).append(":\n");
+          try {
+            java.util.List<java.io.File> all = new java.util.ArrayList<>();
+            java.util.ArrayDeque<java.io.File> q = new java.util.ArrayDeque<>();
+            q.add(d);
+            int n = 0;
+            while (!q.isEmpty() && n < 60) {
+              java.io.File f = q.poll();
+              java.io.File[] kids = f.listFiles();
+              if (kids == null) continue;
+              for (java.io.File k : kids) {
+                if (k.isDirectory()) q.add(k);
+                else { all.add(k); n++; }
+              }
+            }
+            all.sort(java.util.Comparator.comparing(java.io.File::getAbsolutePath));
+            for (java.io.File f : all) {
+              sb.append("  ").append(f.getAbsolutePath())
+                .append("  ").append(f.length()).append("B  mtime=")
+                .append(f.lastModified()).append('\n');
+            }
+          } catch (Throwable t) { sb.append("  <扫描失败 ").append(t).append(">\n"); }
+        }
+        yield sb.toString();
+      }
       case "guestdata-persist" -> {
         boolean persistent = false;
         String detail = "";
@@ -681,8 +720,24 @@ public class Server {
                         int slash = pn.lastIndexOf('/');
                         if (slash >= 0) pn = pn.substring(slash + 1);
                         if (pn.isEmpty()) pn = "default";
-                        java.io.File dir = new java.io.File(System.getProperty("data.dir", "data"), "shared_prefs");
+                        // 2026-10-04 修正（实测 find-cookie）：System.getProperty("data.dir") 在 ART 里**未设置**，
+                        // 于是退回相对路径 "data" ⇒ 实际写到 <cwd>/data/shared_prefs = /data/shared_prefs，
+                        // 而壳读的是 /data/catclaw/shared_prefs（ANDROID_DATA=/data + data.dir=/data/catclaw）。
+                        // 结果：**回灌一直在成功执行、宿主日志也报「回灌 ok」，但壳永远读不到** ⇒
+                        //   网盘登录态每次 VM 重启即丢（用户 2026-10-04 反馈，绕了几轮才定位到这里）。
+                        // 现在：优先用 ART 实际的 data.dir（形如 /data/catclaw），缺失则退回
+                        //   宿主环境变量 ANDROID_DATA=/data 下的既有约定，最后才是 /data。
+                        String dataDir = System.getProperty("data.dir");
+                        java.io.File dir;
+                        if (dataDir != null && dataDir.startsWith("/")) {
+                            dir = new java.io.File(dataDir, "shared_prefs");
+                        } else {
+                            String envData = System.getenv("ANDROID_DATA");
+                            dir = new java.io.File((envData != null && !envData.isEmpty() ? envData : "/data")
+                                    + "/catclaw", "shared_prefs");
+                        }
                         if (!dir.isDirectory()) dir.mkdirs();
+                        System.err.println("[prefs] 回灌落点 " + dir.getAbsolutePath());
                         java.nio.file.Files.write(new java.io.File(dir, pn + ".xml").toPath(),
                                 xml.getBytes(java.nio.charset.StandardCharsets.UTF_8));
                         System.err.println("[prefs] 宿主回灌 " + pn + "（" + xml.length() + "B）");
@@ -1188,7 +1243,14 @@ public class Server {
      */
     private static void sharedbSync() {
         try {
+            // 2026-10-04 修正路径（实测 find-cookie 输出）：
+            //   /data/cache/sharedb **不存在**；网盘 Cookie 实际在 /data/catclaw/shared_prefs/
+            //   （guazi_auth.xml 718B / spUtils.xml 404B / pan_sort.xml …，与 ANDROID_DATA=/data
+            //   且 ART data.dir=/data/catclaw 一致）。原路径按旧壳写死 ⇒ sharedbSync 永远
+            //   「目录不存在」，桥从不发 file-sync，宿主 guest-prefssharedb 从未被创建。
+            //   现在：旧路径优先（仍兼容用旧壳的源），不存在则用 /data/catclaw/shared_prefs。
             java.io.File dir = new java.io.File("/data/cache/sharedb");
+            if (!dir.isDirectory()) dir = new java.io.File("/data/catclaw/shared_prefs");
             java.io.File[] fs = dir.listFiles();
             StringBuilder key = new StringBuilder();
             org.json.JSONArray files = new org.json.JSONArray();
