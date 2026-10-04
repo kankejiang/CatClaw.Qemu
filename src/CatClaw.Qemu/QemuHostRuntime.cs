@@ -397,10 +397,23 @@ public sealed class QemuHostRuntime : IDisposable
                 //   X86_64 = -M q35 -cpu max + WHPX 硬件虚拟化优先（Windows 原生虚拟化平台，
                 //     接近原生速度），QEMU 多 -accel 依次尝试：whpx 不可用自动落 tcg。
                 "-M", Arch == GuestArch.X86_64 ? "q35" : "virt",
-                "-cpu", Arch == GuestArch.X86_64 ? "max" : "cortex-a76",
+                // 2026-10-03：x86 由 -cpu max 改为 -cpu host。
+                //   max = 向 guest 暴露「所有可能的 CPU 特性」（含 SVE/SME 等），QEMU 必须逐条模拟；
+                //   host = 直接用宿主 CPU 特性（WHPX 下这本就是硬件虚拟化的常态），少一层模拟开销。
+                //   本项目 aarch64 侧已因 max 打开 SVE 而让 TCG 慢 22%（见上方注释），x86 侧同理。
+                //   CATCLAW_CPU 可回退（排障用）：-p 无入口，故走环境变量。
+                "-cpu", Arch == GuestArch.X86_64
+                    ? (Environment.GetEnvironmentVariable("CATCLAW_CPU") is { Length: > 0 } c ? c : "host")
+                    : "cortex-a76",
                 "-m", memMb.ToString(), "-smp", SmpCount.ToString(), "-nographic",
+                // 2026-10-03：WHPX 加速器补 kernel-irqchip=off —— 免掉内核态 irqchip 模拟，减少 VM exit。
+                //   CATCLAW_ACCEL_OPTS 可追加/回退（例如 "kernel-irqchip=on"）。
+                // 2026-10-04：WHPX 默认补 kernel-irqchip=off —— 免掉内核态 irqchip 模拟、减少 VM exit。
+                //   CATCLAW_ACCEL_OPTS 可追加其它选项，或整条回退（例如设成 "kernel-irqchip=on"）。
                 "-accel", Arch == GuestArch.X86_64
-                    ? (string.IsNullOrWhiteSpace(accelOverride) ? "whpx" : accelOverride)
+                    ? (string.IsNullOrWhiteSpace(accelOverride)
+                        ? "whpx" + (Environment.GetEnvironmentVariable("CATCLAW_ACCEL_OPTS") is { Length: > 0 } accelOpts ? "," + accelOpts : ",kernel-irqchip=off")
+                        : accelOverride)
                     : "tcg,tb-size=256,split-wx=off",
                 "-L", "share",
                 "-kernel", KernelName,
@@ -484,6 +497,11 @@ public sealed class QemuHostRuntime : IDisposable
             // 合并 guest 模式：ART initrd 的迅雷段据此拉起 harness（见 QemuArtGuest.ThunderMerged）
             if (ThunderPort > 0) append += $" thunderport={ThunderPort}";
             if (!string.IsNullOrEmpty(MagnetOverride)) append += $" magnet={MagnetOverride}";
+            // 2026-10-03：显式指定 RTC 时基 —— guest 用的内核在无 RTC 源时会退化到自身计数，
+            //   冷启动后 guest 时钟会明显落后于宿主（jar 侧签名/令牌校验对此敏感）。
+            //   base=utc：guest 用 UTC 计时；clock=host：跟随宿主墙钟。
+            args.Add("-rtc");
+            args.Add("base=utc,clock=host");
             args.Add("-append");
             args.Add(append);
             _log?.Invoke($"[qemu] guest 内存 {memMb}MB · tmpfs {tdataMb}MB · swap={(SwapStore is null ? "无" : SwapStore.CapacityBytes / 1024 / 1024 + "MB")} · {append}");
