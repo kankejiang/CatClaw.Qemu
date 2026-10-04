@@ -127,6 +127,21 @@ public class Server {
         // 桌面直跑模式该端口被占用时静默失败不影响主流程。
         try { bridge.GuardCtrl.start(); } catch (Throwable ig) { }
 
+        // 2026-10-04：网盘 Cookie 持久化 —— **定时**同步 sharedb，不只等 call 之后。
+        // 起因：原逻辑只在每个 call 结束时同步，于是「扫码成功但之后没再调用该站」时
+        // config.db 永远不上行，宿主拿不到 Cookie，VM 重启登录态即丢（用户 2026-10-04 反馈）。
+        // 这里加一个 5s 周期线程：开机、扫码后不必再触发任何调用，Cookie 都会被推给宿主。
+        try {
+            Thread sync = new Thread(() -> {
+                while (true) {
+                    try { sharedbSync(); } catch (Throwable ignore) { }
+                    try { Thread.sleep(5000L); } catch (InterruptedException ie) { return; }
+                }
+            }, "bridge-sharedb-sync");
+            sync.setDaemon(true);
+            sync.start();
+        } catch (Throwable ig) { }
+
         // 把 AES/*/PKCS7 别名到 PKCS5（标准 JVM 不提供 PKCS7 命名）→ 否则爬虫的接口加解密直接失败。
         // ART 里不装：conscrypt 自带的 BC 原生就认 PKCS7Padding，我们的包装反而会盖掉真实现。
         if (!Art.onArt()) Pkcs7Provider.install();
@@ -1189,6 +1204,13 @@ public class Server {
                 }
             }
             String k = key.toString();
+            // 2026-10-04 诊断：sharedb 一直空时也打一行，否则宿主侧只能看到「file-sync 零条」，
+            // 分不清是「目录不存在」「空目录」还是「有文件但没变」。
+            if (files.length() == 0) {
+                System.err.println("[srv] sharedb 同步：目录 "
+                        + (dir.exists() ? "存在但为空" : "不存在")
+                        + "（" + dir.getAbsolutePath() + "）");
+            }
             if (k.equals(sharedbKey)) return;
             sharedbKey = k;
             if (files.length() > 0) {
