@@ -131,7 +131,18 @@ def main():
     dexdump = os.path.join(SDK, "build-tools", "36.0.0", "dexdump.exe")
     d8 = os.path.join(SDK, "build-tools", "36.0.0", "lib", "d8.jar")
     aj = os.path.join(SDK, "platforms", "android-35", "android.jar")
-    bridge_jar = os.path.join(BRIDGE, "bridge.jar")
+    # bridge.jar 的位置在 2026-10-03 三仓库拆分后有两个候选：build.cmd 现在写在
+    # guest/java/bridge.jar，而本脚本按拆分前的老布局找 guest/bridge.jar。
+    # 优先取构建产物；若两处都在，取**更新的那个**——否则会拿上一次遗留的旧 jar 出包，
+    # 表现就是"源码改了、dex 里还是旧的"（2026-10-05 实测踩过一次，靠比对 dex 里
+    # 有没有新符号才发现）。
+    cand = [os.path.join(BRIDGE, "java", "bridge.jar"), os.path.join(BRIDGE, "bridge.jar")]
+    cand = [p for p in cand if os.path.isfile(p)]
+    if not cand:
+        raise SystemExit("缺文件：guest/java/bridge.jar 或 guest/bridge.jar（先跑 guest/java/build.cmd）")
+    bridge_jar = max(cand, key=os.path.getmtime)
+    if len(cand) > 1:
+        print("bridge.jar 取：" + bridge_jar)
     for p in (dexdump, d8, aj, bridge_jar, TVBOX):
         if not os.path.isfile(p):
             raise SystemExit("缺文件：" + p)

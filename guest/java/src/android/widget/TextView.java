@@ -38,11 +38,17 @@ public class TextView extends View {
     public TextView(Context c, AttributeSet attrs) { super(c, attrs); }
 
     // ── 文本 ──
-    public void setText(CharSequence t) { text = t == null ? "" : t; }
+    /**
+     * 真 Android 的 {@code setText()} 会标脏并重绘；桩里只存字段 ⇒ 对话框里
+     * "加载中… → 账号信息/已登录" 这类**只 setText 不 invalidate** 的更新，
+     * 宿主永远停在第一帧（2026-10-05 用户实测"这个 UI 不会实时刷新"）。
+     * 补一次 invalidate()：它在 View 里接到 Dialog.noteInvalidate()，是刷新线程的唯一触发点。
+     */
+    public void setText(CharSequence t) { text = t == null ? "" : t; invalidate(); }
     public void setText(int resId) { text = ""; }
-    public void setText(char[] t, int start, int len) { text = new String(t, start, len); }
+    public void setText(char[] t, int start, int len) { text = new String(t, start, len); invalidate(); }
     public CharSequence getText() { return text; }
-    public void append(CharSequence t) { text = String.valueOf(text) + (t == null ? "" : t); }
+    public void append(CharSequence t) { text = String.valueOf(text) + (t == null ? "" : t); invalidate(); }
     public int length() { return String.valueOf(text).length(); }
     public void setHint(CharSequence hint) { }
     public CharSequence getHint() { return ""; }

@@ -190,13 +190,42 @@ public class Dialog implements DialogInterface {
                 java.util.List<java.util.List<Integer>> rows2 = new java.util.ArrayList<>();
                 StringBuilder plain2 = new StringBuilder();
                 org.json.JSONObject tree = treeOf(view, nodes2, labels2, rows2, plain2);
-                if (tree != null) ev.put("tree", tree);
+                if (tree != null) { ev.put("tree", tree); lastTreeSent = tree.toString(); }
             }
             UiBridge.emit(ev);
         } catch (Throwable t) {
             System.err.println("[ui] 重发行数据失败: " + t);
         }
     }
+
+    /**
+     * 把当前整树重发一次（宿主 {@code SpiderTreeDialogPage.UpdateTree} 就地换新）。
+     *
+     * <p>为什么必须有：{@link #refreshRows()} 只在 jar 响应点击之后被调用，而网盘状态框是
+     * "先弹『加载中…』→ 异步拿到账号信息 → setText"，用户**一次都不点**，
+     * 于是宿主永远停在第一帧（2026-10-05 实测：桥侧视图树已经是"已登录"，
+     * 宿主界面上还是"正在获取账号信息…"）。刷新线程原先只补发二维码，文本变了什么都不发。</p>
+     *
+     * <p>线程每 500ms 轮询，所以按序列化结果去重：文字没变就一个字节都不发。</p>
+     */
+    void emitTreeUpdate() {
+        if (view == null || seq < 0 || !UiBridge.isPending(seq)) return;
+        try {
+            JSONObject tree = treeOf(view, new java.util.ArrayList<>(), new java.util.ArrayList<>(),
+                    new java.util.ArrayList<>(), new StringBuilder());
+            if (tree == null) return;
+            String s = tree.toString();
+            if (s.equals(lastTreeSent)) return;
+            lastTreeSent = s;
+            UiBridge.emit(new JSONObject().put("ev", "ui-rows").put("seq", seq).put("tree", tree));
+            System.err.println("[ui] 补发 ui-rows(tree) seq=" + seq + " " + s.length() + " 字符");
+        } catch (Throwable t) {
+            System.err.println("[ui] 补发整树失败: " + t);
+        }
+    }
+
+    /** 最近一次上行的整树序列化结果，用于去重（刷新线程 500ms 一轮）。 */
+    private volatile String lastTreeSent;
 
     /** 节点当前文本（含后代 TextView），空格连接 —— jar 就地 setText 后按它重算。 */
     private static String nodeText(android.view.View v) {
@@ -445,19 +474,20 @@ public class Dialog implements DialogInterface {
                 for (int i = 0; i < 240; i++) {
                     try { Thread.sleep(500); } catch (InterruptedException e) { return; }
                     Dialog d = sLastShown;
-                    if (d == null || !d.dirty || d.qrSent || !UiBridge.isPending(d.seq)) continue;
+                    // qrSent 不再当总闸：码补发过之后，文本还会继续变（"加载中→账号信息"）
+                    if (d == null || !d.dirty || !UiBridge.isPending(d.seq)) continue;
                     d.dirty = false;
                     JSONObject spec = new JSONObject();
                     d.quickHunt = true;
                     try { d.fillSpec(spec); } catch (Throwable ignored) { } finally { d.quickHunt = false; }
-                    if (spec.opt("qr") instanceof JSONObject q) {
+                    if (!d.qrSent && spec.opt("qr") instanceof JSONObject q) {
                         d.qrSent = true;
                         try {
                             UiBridge.emit(new JSONObject().put("ev", "ui-qr").put("seq", d.seq)
                                     .put("title", d.title == null ? "" : d.title.toString()).put("qr", q));
                             System.err.println("[ui] 补发 ui-qr seq=" + d.seq + " " + q.optInt("w") + "x" + q.optInt("h"));
                         } catch (Throwable ignored) { }
-                    } else if (spec.opt("qrText") instanceof String u && u.length() > 0) {
+                    } else if (!d.qrSent && spec.opt("qrText") instanceof String u && u.length() > 0) {
                         // 链接是异步才落进视图树的（壳先弹框、拿到 URL 再 setText+invalidate）：
                         // 补发同一 seq 的 ui-qr，但带 qrText —— 宿主自己出码，桩侧不画任何东西。
                         d.qrSent = true;
@@ -466,6 +496,10 @@ public class Dialog implements DialogInterface {
                                     .put("title", d.title == null ? "" : d.title.toString()).put("qrText", u));
                             System.err.println("[ui] 补发 ui-qr(qrText) seq=" + d.seq + " " + u.length() + " 字符");
                         } catch (Throwable ignored) { }
+                    } else {
+                        // 没有新码可补发：多半只是文本变了（网盘状态框"加载中→已登录/账号信息"），
+                        // 走宿主已有的整树换新通道，否则界面永远停在 show 那一刻的第一帧
+                        d.emitTreeUpdate();
                     }
                 }
             } finally {
