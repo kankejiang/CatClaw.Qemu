@@ -1,12 +1,12 @@
 {
-  "generated": "2026-10-03",
+  "generated": "2026-10-05",
   "tag": "vm-assets-v1",
   "repo": "kankejiang/CatClaw.Qemu",
   "assets": [
     {
       "name": "qemu-guest-win64.zip",
-      "size": 466465224,
-      "sha256": "5d8ae74827bb8ac76c1a0cb1783d395242f192129e8696547298f23a5d99730d",
+      "size": 465031310,
+      "sha256": "18e2e8552ff0cc3c2c626883763587cd79b38c2b9a9e5074b70fc9827d75cee5",
       "tag": "vm-assets-v1"
     },
     {
