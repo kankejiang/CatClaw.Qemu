@@ -22,6 +22,8 @@
 #include <unistd.h>
 #include <ucontext.h>
 #include <fcntl.h>
+#include <sys/stat.h>
+#include <errno.h>
 
 /* libsigchain 要求**主程序**导出这三个符号（实测 tombstone：
  *   #01 libsigchain.so AddSpecialSignalHandlerFn+20
@@ -62,6 +64,32 @@ static void chain_remove(int signal, chain_fn fn) {
     }
 }
 
+/* ── 崩溃现场输出（定义在「崩溃点定位」之前，因为 dump_map_for 既要用 sig_out，也要用
+ *    预算常量判断"还要不要花那次 256KB 的 maps 读"）。策略与历史见下面 sig_trampoline 段。 ── */
+static int g_siglog;   /* main 开头读一次环境变量，信号处理内不做 getenv（非异步安全） */
+static int g_sigfd = -1;
+#define SIG_FILE_MAX_LINES 400    /* ≈130 次崩溃（每次 3 行）：防 ndk 高频 fault 刷盘 */
+#define SIG_STDERR_MAX_LINES 6    /* 管道只有 64KB，写 6 行指路牌足够 */
+static int g_sig_lines;
+static int g_sig_stderr_left;
+static int g_sig_note;
+
+/* 现场输出：文件为主、stderr 为辅。全程只用 write（异步信号安全）。写失败一律静默 ——
+ * 崩溃处理器里没有可恢复动作，更不能让「记录崩溃」变成第二次崩溃。 */
+static void sig_out(const char *p, size_t n) {
+    if (!g_siglog) return;
+    if (g_sigfd >= 0) {
+        if (g_sig_lines < SIG_FILE_MAX_LINES) { if (write(g_sigfd, p, n) > 0) g_sig_lines++; }
+        else if (!g_sig_note) {
+            g_sig_note = 1;   /* 只报一次：宿主看到这行就知道后面的事件被预算压掉了，别当成"没崩" */
+            static const char tail[] = "[sig] 现场预算用完，之后的事件不再记录\n";
+            write(g_sigfd, tail, sizeof tail - 1);
+        }
+    }
+    /* stderr 照旧留几行当指路牌（宿主 console 里看得见"崩过、现场在哪个文件"） */
+    if (g_sig_stderr_left > 0) { g_sig_stderr_left--; write(2, p, n); }
+}
+
 /* 崩溃点定位：在信号里直接查 /proc/self/maps，打印 PC 落在哪个模块+偏移（纯 syscall，
  * 异步信号安全；不要在这里用 stdio/malloc）。壳 so 是运行时解密加载的，启动时的
  * maps 不完整——所以必须现场解析。 */
@@ -76,6 +104,10 @@ static unsigned long hexval(const char *s, int n) {
 }
 
 static void dump_map_for(unsigned long pc) {
+    /* 预算用完就整段跳过：真正贵的是这里（读 256KB 的 /proc/self/maps + 逐行解析）。
+     * ndk 转译 fault 是高频事件（2026-09-27 就是把 stderr 管道按这个频率刷爆的），
+     * 光限制"写多少行"不够，必须连读一起省掉。 */
+    if (g_siglog && g_sig_lines >= SIG_FILE_MAX_LINES) return;
     int fd = open("/proc/self/maps", O_RDONLY);
     if (fd < 0) return;
     /* ART 进程的 maps 很长（上千行），缓冲必须大——否则后加载的壳 so / 转译代码区读不到，
@@ -93,7 +125,7 @@ static void dump_map_for(unsigned long pc) {
     buf[total] = 0;
     if (total == 0 || total >= (int) sizeof buf - 1) {
         static const char w[] = "[sig] 崩溃点: maps 读取异常/截断，未匹配\n";
-        write(2, w, sizeof w - 1);
+        sig_out(w, sizeof w - 1);
         return;
     }
     for (int p = 0; p < total; ) {
@@ -113,9 +145,9 @@ static void dump_map_for(unsigned long pc) {
                 unsigned long hi = hexval(line + dash + 1, sp - dash - 1);
                 if (lo && pc >= lo && pc < hi) {
                     static const char tag[] = "[sig] 崩溃点: ";
-                    write(2, tag, sizeof tag - 1);
-                    write(2, line, (size_t) len);
-                    write(2, "\n", 1);
+                    sig_out(tag, sizeof tag - 1);
+                    sig_out(line, (size_t) len);
+                    sig_out("\n", 1);
                     return;   // 命中即收（break 会掉到末尾再打一行"未匹配"，误导排查）
                 }
             }
@@ -123,17 +155,41 @@ static void dump_map_for(unsigned long pc) {
         p = e + 1;
     }
     static const char w[] = "[sig] 崩溃点: 未匹配任何 maps 区间（PC 可能在转译 JIT 区/已卸载）\n";
-    write(2, w, sizeof w - 1);
+    sig_out(w, sizeof w - 1);
 }
 
 /* 信号哨兵（2026-09-27）：壳真实类首调转译代码后 SIGSEGV 无 dump 直接 139 死，
  * trampoline 包住注册进来的 handler，记信号号/故障码/故障地址后转发。
- * ⚠ 日志默认关（CATCLAW_SIGLOG=1 才 write）：宿主握手期 console 管道无人读，
+ * ⚠ 原先「日志默认关（CATCLAW_SIGLOG=1 才 write）」的理由：宿主握手期 console 管道无人读，
  * ndk 转译 fault 的 SIGSEGV 是高频信号，write 很快写满 64KB 管道缓冲 → 信号处理内
  * 阻塞 → guest 全线程冻住 → 探针 ping 永远无应答（2026-09-27 宿主 WHPX 实锤，
  * 15:50 无哨兵构建同一流程是通的）。环形内存缓冲不值得——fatal 由 ndk 自己 _exit，
- * 我们没有稳定的 dump 时机；要取证时在 108 上开着跑即可。 */
-static int g_siglog;   /* main 开头读一次环境变量，信号处理内不做 getenv（非异步安全） */
+ * 我们没有稳定的 dump 时机；要取证时在 108 上开着跑即可。
+ *
+ * 2026-10-05 改道：现场主要写进**持久盘上的文件**（默认 /data/catclaw/sig-crash.log，
+ *   stderr 只留前 6 行当指路牌）。理由是「默认关」这个前提本身变了：
+ *   ① 管道写满会冻住全线程，文件不会 —— 死穴是 stderr 独有的，不该由此决定要不要留现场；
+ *   ② /data 自 2026-10-05 起是 ext4 数据盘（见「网盘登录持久化」报告），桥 139 死掉之后
+ *      宿主把桥重起来、用 op=readfile 就能捞到**上一次崩溃**的现场。
+ *   #42/#46 一直查不动就是因为没现场（`[sig]` 计数 0 而 `退出码=139` 有 5 次）。
+ *   行数照旧封顶，高频转译 fault 既刷不爆管道也刷不爆盘。
+ *   （现场输出 sig_out 与预算常量定义在文件上方「崩溃现场输出」段，dump_map_for 要用。） */
+
+/* 崩溃现场自检（2026-10-05）：`CATCLAW_SIGTEST=<秒>` 时到点制造一次**真**空指针写。
+ * 为什么要有它：现场链路「handler → 持久盘文件 → 宿主 op=readfile」如果只能等自然崩溃来验，
+ * 就永远拿不到判据（2026-10-05 实测：homeContent/categoryContent 各跑一次都不崩，文件里只有
+ * 两条启动标记）。有了它，判据变成可控实验 —— 不装处理器就必然没有现场，装了就有。
+ * 只在显式带该环境变量时生效，生产 init 不带；崩溃发生在**桥自己的进程**里，与真崩溃同路径
+ * （trampoline → 链上无人处理 → _exit(128+11) → init 监督器重启桥）。 */
+static void *sigtest_thread(void *arg) {
+    int secs = (int) (long) arg;
+    sleep(secs);
+    volatile int *p = NULL;
+    fprintf(stderr, "[sig] 自检：即将制造一次真实空指针写（pid=%lx 十六进制）\n", (unsigned long) getpid());
+    fflush(stderr);
+    *p = 1;                     /* si_addr=0，PC 落在 artlaunch 自己的代码段 —— maps 行应能命中 */
+    return NULL;
+}
 
 static void sig_trampoline(int sig, siginfo_t *info, void *ctx) {
     if (g_siglog) {
@@ -180,7 +236,7 @@ static void sig_trampoline(int sig, siginfo_t *info, void *ctx) {
         for (int i = 15; i >= 0; i--) buf[n + (15 - i)] = hex[(pc >> (i * 4)) & 0xf];
         n += 16;
         buf[n++] = '\n';
-        write(2, buf, n);
+        sig_out(buf, (size_t) n);
         /* 2026-10-03：附加 /proc/self/cmdline——fork 子进程继承哨兵，pid+cmdline 才能区分
          * 崩溃来自桥本体还是 exec 前的子进程。全是 syscall，异步信号安全。 */
         {
@@ -197,7 +253,7 @@ static void sig_trampoline(int sig, siginfo_t *info, void *ctx) {
                     for (i = 0; i < cn; i++)            /* NUL 参数分隔符换成空格 */
                         if (cbuf[16 + i] == '\0') cbuf[16 + i] = ' ';
                     cbuf[16 + cn] = '\n';
-                    write(2, cbuf, 16 + cn + 1);
+                    sig_out(cbuf, (size_t)(16 + cn + 1));
                 }
             }
         }
@@ -277,6 +333,77 @@ static void *thread_runner(void *arg) {
 
 int main(int argc, char **argv) {
     g_siglog = getenv("CATCLAW_SIGLOG") != NULL;
+    const char *sigtest_env = getenv("CATCLAW_SIGTEST");   /* 自检秒数，见 sigtest_thread 上方注释。
+     * 变量名带前缀是因为本函数里另有一个 `struct stat st`（轮转判断用），共用一个名字会撞。 */
+    /* 现场落盘（2026-10-05）：/data 自今天起是持久 ext4 数据盘，桥 139 死掉后宿主把桥重起来、
+     * 用 op=readfile 就能捞到**上一次崩溃**的现场（以前只有 stderr，重启即丢）。
+     * 路径可用 CATCLAW_SIGFILE 覆盖（台架用）。轮转用改名不用清空：改名保住的是旧现场，
+     * 而清空会把刚要查的那次一起清掉。 */
+    if (g_siglog) {
+        const char *path = getenv("CATCLAW_SIGFILE");
+        if (!path || !*path) path = "/data/catclaw/sig-crash.log";
+        struct stat st;
+        if (stat(path, &st) == 0 && st.st_size > 262144) {
+            char bak[512];
+            snprintf(bak, sizeof bak, "%s.1", path);      /* main 上下文，非信号内，stdio 可用 */
+            if (rename(path, bak) != 0)
+                fprintf(stderr, "[sig] 轮转失败 %s->%s: %s\n", path, bak, strerror(errno));
+        }
+        g_sigfd = open(path, O_WRONLY | O_CREAT | O_APPEND | O_CLOEXEC, 0644);
+        if (g_sigfd < 0)
+            fprintf(stderr, "[sig] 现场文件打不开 %s: %s（退化为只写 stderr）\n", path, strerror(errno));
+        else
+            fprintf(stderr, "[sig] 现场落 %s（stderr 只留前 %d 行）\n", path, SIG_STDERR_MAX_LINES);
+        g_sig_stderr_left = SIG_STDERR_MAX_LINES;
+        /* 开机/进程边界标记：宿主拿 `[sig] --- ... pid=` 与 init 的「退出码=139」对齐，
+         * 才知道哪一段现场属于哪一次开机。
+         * ⚠ pid 这里也打**十六进制**，跟现场行的 `p=` 同一进制（那行是 2026-10-03 定的 hex 习惯）——
+         *   2026-10-05 自检实测：标记用十进制（pid=263）、现场用十六进制（p=107），同一个进程看着
+         *   像两个进程，白查了一轮。 */
+        char mark[96];
+        int mn = snprintf(mark, sizeof mark,
+                          "[sig] --- artlaunch 启动 pid=%lx（十六进制）自检=%s ---\n",
+                          (unsigned long) getpid(),
+                          (sigtest_env && *sigtest_env) ? sigtest_env : "无");
+        if (mn > 0 && g_sigfd >= 0) {
+            ssize_t w = write(g_sigfd, mark, (size_t) mn);
+            (void) w;
+            g_sig_lines++;
+        }
+    }
+    /* 兜底注册（2026-10-05）：正常路径是 ART 的 FaultManager 经 SetSpecialSignalHandlerFn
+     * 把 trampoline 设成进程 handler（2026-10-01 实测有 [sig] 输出，证明这条通）。但
+     * CreateJavaVM **之前**的原生段没人注册，那一段崩了就是无声 139 —— 先替四个致命信号
+     * 占位。只在当前是 SIG_DFL 时才装，不抢任何已装 handler；ART 之后注册照样进链，
+     * 「后注册者先处理」的语义不变。 */
+    {
+        const int fatal[4] = {SIGSEGV, SIGBUS, SIGABRT, SIGFPE};
+        for (int i = 0; i < 4; i++) {
+            struct sigaction cur;
+            if (sigaction(fatal[i], NULL, &cur) != 0) continue;
+            if (cur.sa_handler != SIG_DFL) continue;
+            struct sigaction sa;
+            memset(&sa, 0, sizeof sa);
+            sa.sa_sigaction = sig_trampoline;
+            sa.sa_flags = SA_SIGINFO | SA_RESTART;
+            sigemptyset(&sa.sa_mask);
+            sigaction(fatal[i], &sa, NULL);
+        }
+    }
+    /* 自检排程（见 sigtest_thread 上方注释：只在带 CATCLAW_SIGTEST 时生效） */
+    {
+        if (sigtest_env && *sigtest_env) {
+            int secs = atoi(sigtest_env);
+            if (secs <= 0) secs = 25;
+            pthread_t th;
+            if (pthread_create(&th, NULL, sigtest_thread, (void *) (long) secs) == 0) {
+                pthread_detach(th);
+                fprintf(stderr, "[sig] 自检已排程：%d 秒后制造一次崩溃\n", secs);
+            } else {
+                fprintf(stderr, "[sig] 自检线程创建失败: %s\n", strerror(errno));
+            }
+        }
+    }
     /* 属性可达性探针：nativebridge 属性是否经 proppreload 可读（libart 同进程同路径）。
      * 输出空值 = 拦截缺口（proppreload 缺 __system_property_find/read_callback 实现）。 */
     {

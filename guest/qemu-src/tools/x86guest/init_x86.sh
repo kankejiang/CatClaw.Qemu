@@ -16,7 +16,10 @@ done
 # ext4 持久数据盘要用的模块（2026-10-04 补回）：缺它们时下面的 mount -t ext4 会失败，
 # 于是 /data 退回 tmpfs ⇒ **网盘登录态每次重启都丢**（用户 2026-10-04 反馈）。
 # crc32c_generic 是 metadata_csum 的必需项；jbd2 是日志回放（QEMU 硬杀安全）所需。
-for m in crc32c_generic jbd2 mbcache ext4 binfmt_misc; do
+# ⚠ crc16 曾被漏掉：`modinfo -F depends ext4.ko` = jbd2,mbcache,**crc16**，
+#   少它则 insmod ext4 报 "unknown symbol in module" → /proc/filesystems 里没有 ext4
+#   → mount 报 "No such device"(ENODEV) → 持久盘形同不存在（盘本身是好的，fsck 能读到 338 个文件）。
+for m in crc16 crc32c_generic mbcache jbd2 ext4 binfmt_misc; do
     [ -f /modules/$m.ko ] || continue
     echo "[init] insmod $m: $($BB insmod /modules/$m.ko 2>&1)" || true
 done
@@ -130,7 +133,11 @@ while [ $i -lt $NBRIDGE ]; do
     (
         try_n=0
         while true; do
-            LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $BP &
+            # 崩溃现场常开（2026-10-05）：artlaunch 把 [sig] 现场写进**持久盘上的文件**，
+            # stderr 只留 6 行指路牌 —— 2026-09-27 那次「console 管道写满 → 信号处理内阻塞 →
+            # 全线程冻住」的死穴是 stderr 独有的，换成文件就没有了。每进程预算 400 行封顶。
+            # 之所以常开：#42/#46 一直查不动的直接原因就是崩溃不留现场（[sig] 0 行 / 退出码 139 五次）。
+            CATCLAW_SIGLOG=1 CATCLAW_SIGFILE=/data/catclaw/sig-crash.log LD_PRELOAD=/proppreload.so /system/bin/artlaunch bridge.GuestMain /gb.dex:/tvbox.apk $BP &
             LP=$!
             if [ -n "$SELFTEST" ] && [ "$i" -eq 0 ] && [ $try_n -eq 0 ]; then
                 (
