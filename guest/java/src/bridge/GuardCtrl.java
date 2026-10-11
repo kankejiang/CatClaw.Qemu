@@ -35,8 +35,15 @@ public final class GuardCtrl {
 
     private GuardCtrl() { }
 
-    /** 启动控制口监听（guest 内 0.0.0.0:18090；失败不影响桥主流程）。 */
-    public static void start() {
+    private static volatile boolean started = false;
+
+    /** 启动控制口监听（guest 内 0.0.0.0:18090；失败不影响桥主流程）。
+     * ★ 幂等守卫（2026-10-06 Round33）：GuestMain 的 accept 循环复用同一 ART 进程跑多次
+     * Server.main，每次都调 start() → 第二次绑 18090 必 EADDRINUSE（实锤日志）。
+     * 同一进程只起一次监听，后续会话复用它。 */
+    public static synchronized void start() {
+        if (started) return;
+        started = true;
         Thread t = new Thread(() -> {
             try (ServerSocket ss = new ServerSocket(18090, 64, InetAddress.getByName("0.0.0.0"))) {
                 System.err.println("[guardctrl] 18090 就绪（GLOAD + 资源服务）");

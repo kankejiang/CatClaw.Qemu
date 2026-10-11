@@ -24,6 +24,13 @@
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <errno.h>
+#include <stdint.h>
+
+/* bionic 私有符号：正常由 <sys/system_properties.h> 声明，但 guest 的 bionic 头不在
+ * 构建期 include 路径里（artlaunch 历来靠隐式声明编过）。这里显式弱声明，
+ * 运行时由 LD_PRELOAD 的 proppreload.so 提供实现；解析不到就返回 NULL，
+ * 属性探针那段会自然跳过，不会崩。 */
+extern int __system_property_get(const char *name, char *value) __attribute__((weak));
 
 /* libsigchain 要求**主程序**导出这三个符号（实测 tombstone：
  *   #01 libsigchain.so AddSpecialSignalHandlerFn+20
@@ -311,7 +318,9 @@ static jmethodID g_test_ng;
 static void *thread_runner(void *arg) {
     printf("artlaunch: [线程实验] 线程函数已进入\n"); fflush(stdout);
     JNIEnv *e3 = NULL;
-    jint arc = (*g_test_vm)->AttachCurrentThread(g_test_vm, &e3, NULL);
+    /* AttachCurrentThread 的第 2 参签名是 JNIEnv**；用匹配类型传，避免指针类型不严格告警。 */
+    JNIEnv **penv = &e3;
+    jint arc = (*g_test_vm)->AttachCurrentThread(g_test_vm, penv, NULL);
     printf("artlaunch: [线程实验] AttachCurrentThread = %d\n", arc); fflush(stdout);
     if (arc == JNI_OK && e3) {
         jstring r3 = (jstring) (*e3)->CallStaticObjectMethod(e3, g_test_sp, g_test_ng,
@@ -474,14 +483,20 @@ int main(int argc, char **argv) {
             bool (*isPS)(const char *) = (bool (*)(const char *)) dlsym(nbl2, "NativeBridgeIsPathSupported");
             if (isAv) printf("artlaunch: [审计] NativeBridgeIsAvailable = %d\n", isAv());
             if (isPS) {
-                /* ndk 的路径白名单模式探测：官方 app 的 native 库目录以 lib/arm64 结尾 */
+                /* ndk 的路径白名单模式探测：官方 app 的 native 库目录以 lib/arm64 结尾。
+                 * ⚠ 下面 /thunder 那三条是 Guard 壳的 arm64 so 真实落点（2026-10-10 实测）：
+                 *   壳把 so 解到 /thunder/data/cache/.ftyfn… 再 System.load。修白名单前后
+                 *   必看这几行的返回值变化——它们从 0 变 1 才算真修好（2026-10-10 修复前全 0）。 */
                 const char *paths[] = {
                     "/data/catclaw/art/lib",
                     "/data/catclaw/art/lib/arm64",
                     "/data/app/~~abc==/com.foo.bar-xyz==/lib/arm64",
                     "/system/lib64/arm64",
+                    "/thunder",
+                    "/thunder/data/cache",
+                    "/thunder/data/fishso",
                 };
-                for (int i = 0; i < 4; i++)
+                for (int i = 0; i < 7; i++)
                     printf("artlaunch: [审计] IsPathSupported(%s) = %d\n", paths[i], isPS(paths[i]));
             }
         }
@@ -607,6 +622,123 @@ int main(int argc, char **argv) {
         fflush(stdout);
         if (InitNB) printf("artlaunch: InitializeNativeBridge = %d\n", InitNB(env, "arm64"));
         else printf("artlaunch: 无 InitializeNativeBridge 符号\n");
+        fflush(stdout);
+    }
+
+    /* ══ 审计 3（2026-10-10 重定位）：namespace 桥接通路 ══
+     *
+     * 旧的 IsPathSupported 审计挂在 L472 那块里，跑在 InitializeNativeBridge **之前**——
+     * 此刻 ndk 还没 initialize，所有判定都是假值（它 4 条全 0 就是这么来的，不能当证据）。
+     *
+     * 2026-10-10 探针实测（同一份 /system/lib64/arm64/libc++.so 复制到 6 个路径逐一
+     * System.load，含 "/lib/arm" 的与原目录同目录的全灭）⇒ System.load 失败与**路径无关**。
+     * 而 artlaunch 直调 NativeBridgeLoadLibrary("libc++.so") = OK ⇒ 桥本身能加载 arm64。
+     * 分水岭是**调用者**：ART 侧要求 classloader 的 namespace 被标成 bridged，
+     * artlaunch 直调回调绕过了这道判据。
+     *
+     * 新怀疑（待本段证实）：/system/lib64 下只有 libnativebridge_lazy.so（5488B），
+     * 它导出的 6 个符号是 {Needs,PreInitialize,Available,Initialized,GetTrampoline,GetError}；
+     * 而 libnativeloader.so 要的 7 个是 {IsPathSupported, CreateNamespace, LoadLibraryExt,
+     * LinkNamespaces, GetExportedNamespace, InitAnonymousNamespace, UnloadLibrary}。
+     * **两组完全不重叠** ⇒ nativeloader 若解析到 _lazy 桩则全部落空 → namespace 永不 bridged。
+     * 完整转发实现在 apex/com.android.art/lib64/libnativebridge.so（15168B，含 LoadNativeBridge）。
+     */
+    {
+        void *nbl3 = dlopen("libnativebridge.so", RTLD_NOW | RTLD_GLOBAL);
+        printf("artlaunch: [审计3] libnativebridge.so handle=%p\n", nbl3);
+        if (nbl3) {
+            Dl_info di;
+            if (dladdr(nbl3, &di) && di.dli_fname)
+                printf("artlaunch: [审计3] 实际加载路径 = %s\n", di.dli_fname);
+        }
+        /* nativeloader 侧真正会去找的那几个符号，逐个报解析结果 */
+        static const char *kNeed[] = {
+            "NativeBridgeIsPathSupported", "NativeBridgeCreateNamespace",
+            "NativeBridgeLoadLibraryExt", "NativeBridgeLinkNamespaces",
+            "NativeBridgeGetExportedNamespace", "NativeBridgeInitAnonymousNamespace",
+            "NativeBridgeUnloadLibrary",
+        };
+        int miss = 0;
+        for (unsigned i = 0; i < sizeof(kNeed) / sizeof(kNeed[0]); i++) {
+            void *p = nbl3 ? dlsym(nbl3, kNeed[i]) : NULL;
+            printf("artlaunch: [审计3] %s = %p\n", kNeed[i], p);
+            if (!p) miss++;
+        }
+        printf("artlaunch: [审计3] nativeloader 需要的符号缺失 %d 个\n", miss);
+        /* InitializeNativeBridge **之后** 再问路径支持——这才是有意义的时序 */
+        bool (*isPS2)(const char *) = nbl3
+            ? (bool (*)(const char *)) dlsym(nbl3, "NativeBridgeIsPathSupported") : NULL;
+        bool (*isAv2)(void) = nbl3
+            ? (bool (*)(void)) dlsym(nbl3, "NativeBridgeAvailable") : NULL;
+        if (isAv2) printf("artlaunch: [审计3] NativeBridgeAvailable = %d\n", isAv2());
+        if (isPS2) {
+            /* 完整路径集（2026-10-11）：把「壳真实落点」与「官方形状」都测一遍。
+             * 旧审计只测 5 条且漏了 /thunder/data/fishso（FishCrypto 的 so 落点）。
+             * 这一块必须跑在 InitializeNativeBridge 之后，否则全是假 0。 */
+            const char *paths[] = {
+                "/data/catclaw/art/lib",
+                "/data/catclaw/art/cache",
+                "/thunder",
+                "/thunder/data/cache",
+                "/thunder/data/fishso",
+                "/system/lib64/arm64",
+                "/data/app/com.x/lib/arm64",
+                "/data/app/catclaw.guest/lib/arm64",
+                "/data/app/~~abc==/com.foo.bar-xyz==/lib/arm64",
+            };
+            for (unsigned i = 0; i < sizeof(paths) / sizeof(paths[0]); i++)
+                printf("artlaunch: [审计3] IsPathSupported(after-init, %s) = %d\n",
+                       paths[i], isPS2(paths[i]));
+        }
+        /* ===== 修复 A（2026-10-11）：给 /thunder 的 arm64 so 落点补 ndk 认的目录形状 =====
+         *
+         * 现象：壳（Guard 家族，含设置中心用的 FishCrypto）把解出来的 arm64 so 落在
+         *   /thunder/data/fishso 与 /thunder/data/cache，实测 NativeBridgeIsPathSupported
+         *   对这两条路径都返 0 ⇒ 该 namespace not-bridged ⇒ System.load 走原生 bionic
+         *   linker ⇒ 「is for EM_AARCH64 (183) instead of EM_X86_64 (62)」。
+         *
+         * 判定规律（本次 boot 三千余行审计输出实测）：**只有带 /data/app/ 前缀的目录
+         *   形状返 1**；/system/lib64/arm64、/thunder/…、/data/catclaw/art/lib 全返 0。
+         *   所以修法不是改 ndk（在只读镜像里），而是给这些落点**造出同形状的入口**：
+         *   建软链 /data/app/<pkg>/lib/arm64 → /thunder/data/xxx。
+         *
+         * 为什么软链而非拷贝：壳会反复重解并覆写 so（实测同名不同 hash 的
+         *   libFishGuard-v8-*.so 连续出现），拷贝会拿到过期副本；软链永远指向最新。
+         */
+        {
+            static const char *kAliased[][2] = {
+                {"/thunder/data/fishso", "/data/app/catclaw.fish/lib/arm64"},
+                {"/thunder/data/cache",  "/data/app/catclaw.cache/lib/arm64"},
+            };
+            for (unsigned i = 0; i < sizeof(kAliased) / sizeof(kAliased[0]); i++) {
+                const char *src = kAliased[i][0], *dst = kAliased[i][1];
+                struct stat st;
+                if (stat(src, &st) != 0 || !S_ISDIR(st.st_mode)) {
+                    /* cache 目录是壳解 so 时的产物，首次启动时还不存在——把它建出来，
+                     * 软链先挂上，壳随后往里解 so 时 ndk 已经认得这条路径。 */
+                    mkdir(src, 0755);
+                    printf("artlaunch: [修复A] 源目录 %s 不存在，已创建（供壳解 so）\n", src);
+                }
+                /* 逐级 mkdir：dst 的父目录 /data/app/catclaw.fish/lib 可能不存在 */
+                char buf[256];
+                size_t n = strlen(dst);
+                if (n >= sizeof(buf)) continue;
+                memcpy(buf, dst, n + 1);
+                for (size_t q = 1; q < n; q++) {
+                    if (buf[q] != 0x2f) continue;
+                    buf[q] = 0;
+                    mkdir(buf, 0755);
+                    buf[q] = 0x2f;
+                }
+                unlink(dst);                      /* 已存在则先摘掉（幂等重跑） */
+                if (symlink(src, dst) == 0)
+                    printf("artlaunch: [修复A] %s -> %s 已建立%s\n", dst, src,
+                           isPS2 ? (isPS2(dst) ? "（IsPathSupported=1 OK）"
+                                                  : "（IsPathSupported 仍=0 FAIL）") : "");
+                else
+                    printf("artlaunch: [修复A] %s -> %s 失败 errno=%d\n", dst, src, errno);
+            }
+        }
         fflush(stdout);
     }
     /* 审计 1：Build 类状态——ndk initialize 触发的 <clinit> 现在应成功（注册已提前）。

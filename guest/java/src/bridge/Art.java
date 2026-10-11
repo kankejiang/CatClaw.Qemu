@@ -41,6 +41,38 @@ public final class Art {
         return f;
     }
 
+    /**
+     * ndk_translation 认可的 nativeLibraryDir 形状（2026-10-10 artlaunch 运行时审计定案）。
+     *
+     * artlaunch 在 {@code InitializeNativeBridge} **之后**逐条问 NativeBridgeIsPathSupported，
+     * 实测（本 boot，三次重复一致）：
+     *
+     * <pre>
+     *   /data/catclaw/art/lib            = 0
+     *   /data/catclaw/art/cache          = 0
+     *   /thunder/data/cache              = 0
+     *   /system/lib64/arm64              = 0
+     *   /data/app/com.x/lib/arm64        = 1   ← 只有这个是 1
+     * </pre>
+     *
+     * ⇒ ndk 认的形状 = {@code /data/app/<pkg>/lib/arm64}（官方 app 的目录约定）。
+     * 缺了 {@code /data/app/} 前缀就是 0 —— 这解释了为什么 2026-10-10 早先把
+     * {@code .../art/lib} 改成 {@code .../art/lib/arm64}（只补了后半截）依然全灭：
+     * 那次实验的 6 个候选里没有一条带 /data/app 前缀。
+     *
+     * 另一条独立事实（探针实测，务必和上一条分开看）：
+     * {@code System.load(<绝对路径>)} 对同一份 arm64 ELF，6 个路径全部失败，
+     * 含含 lib/arm 的、也含 /system/lib64/arm64 原目录同位置的 ⇒ 单纯改 System.load 的
+     * 目标路径没用。真正生效的入口是 classloader 的 nativeLibraryDir，
+     * 因为 ART 判定「这个 namespace 是否 bridged」时用的是它。
+     */
+    private static File nativeLibDir() {
+        File pkg = new File("/data/app/catclaw.guest");
+        File f = new File(pkg, "lib/arm64");
+        f.mkdirs();
+        return f;
+    }
+
     private static volatile App sApp;
 
     public static Context app() {
@@ -730,22 +762,59 @@ public final class Art {
     }
 
     /**
+     * 深栈执行器：把壳代码放到 64MB 独立栈的线程上跑，返回值/异常原样回传。
+     *
+     * <p>为什么要有它（2026-10-06 订阅 jar 实测）：同一个订阅 jar 里多个壳的
+     * {@code init} 必崩，{@code [sig] s=11 c=0} 恒落在
+     * {@code nterp_op_invoke_virtual} 解引用接收者（fault addr 页对齐），
+     * 一天 1.5 万条、引擎重启都压不住。深调用链/大 JSON 解析把默认线程栈吃穿是
+     * 最廉价可排的假设——统一 64MB 栈先止血；若仍崩，artlaunch 哨兵的
+     * regs+maps 落盘（2026-10-06 增强）会给出一手现场。</p>
+     *
+     * <p>线程是普通 {@code java.lang.Thread}，GC 安全；异常链保持原类型
+     * （Exception/Error 原样抛，其余包 RuntimeException）。</p>
+     */
+    public static <T> T runDeep(String what, java.util.concurrent.Callable<T> body) throws Exception {
+        final Object[] out = new Object[1];
+        final Throwable[] err = new Throwable[1];
+        Thread t = new Thread(null, () -> {
+            try {
+                out[0] = body.call();
+            } catch (Throwable e) {
+                err[0] = e;
+            }
+        }, "deep-" + what, 64L * 1024 * 1024);
+        t.start();
+        t.join();
+        if (err[0] instanceof Exception) throw (Exception) err[0];
+        if (err[0] instanceof Error) throw (Error) err[0];
+        if (err[0] != null) throw new RuntimeException(err[0]);
+        @SuppressWarnings("unchecked")
+        T r = (T) out[0];
+        return r;
+    }
+
+    /**
      * 照搬 {@code JarLoader.load(key,file)} + {@code invokeInit} + {@code getSpider}。
      *
      * @param jarPath 原始 jar（Guard 壳 jar 或普通 dex jar 都行；<b>纯 .class 的 java jar 不行</b>，
      *                那种源留在宿主 JVM 侧跑 —— 它本来也没有 ARM 原生码）
      * @return 已 {@code init(Context, ext)} 过的 spider
      */
+
     public static Object loadSpider(String site, String jarPath, String className, String ext) throws Exception {
         jarPath = materialize(jarPath);
         File f = new File(jarPath);
         f.setReadOnly();
+
         String cache = dir("opt").getAbsolutePath();
         // jar 源的 loader 挂「桩优先」parent：爬虫代码的 android.* 解析到 ui_stub.dex 桩
         // （≈ JRE 桥语义，Dialog/Toast 桩才能把 UI 事件发出来）；boot 覆盖是已证死路，只能换命名空间。
         ClassLoader sys = stubFirst();
+        // librarySearchPath 同样必须用 ndk 认的形状：DexClassLoader 构造时 ART 据此建
+        // classloader namespace，而 namespace 是否 bridged 决定了壳 so 走不走 ndk。
         dalvik.system.DexClassLoader loader =
-                new dalvik.system.DexClassLoader(jarPath, cache, dir("lib").getAbsolutePath(), sys);
+                new dalvik.system.DexClassLoader(jarPath, cache, nativeLibDir().getAbsolutePath(), sys);
         System.err.println("[art] DexClassLoader " + f.getName() + " 就绪"
                 + (sys != Art.class.getClassLoader() ? "（parent=桩优先链）" : ""));
         Class<?> cls = loader.loadClass("com.github.catvod.spider." + className);
@@ -776,14 +845,25 @@ public final class Art {
             Class<?> apiCls = sys.loadClass("com.github.catvod.crawler.SpiderApi");
             Method ia = findMethod(cls, "initApi", 1);
             if (ia != null) ia.invoke(sp, apiCls.getDeclaredConstructor().newInstance());
-        } catch (NoSuchMethodException ignored) { }
+        } catch (Throwable ignored) { }
         System.err.println("[art] step#9 initApi ok");
         long t0 = System.currentTimeMillis();
         try {
             // 参数类型可能解析到桩命名空间（Class 身份与 boot 不同），不能 getMethod(Context.class, ...)
             Method m = findMethod(cls, "init", 2);
             System.err.println("[art] step#10 调 " + className + ".init(Context, ext) —— 崩溃若在此后即壳的 init 触发");
-            if (m != null) m.invoke(sp, ctx, ext == null ? "" : ext);
+            if (m != null) {
+                // 2026-10-06：init 走 64MB 深栈线程（runDeep）——多次惨爆桥的 SIGSEGV
+                // 恒落在 nterp_op_invoke_virtual 解引用野接收者（fault addr 页对齐），
+                // 先排除默认栈耗尽一类；仍崩则看 artlaunch 哨兵的 regs+maps 落盘。
+                final Method mf = m;
+                final Object spf = sp;
+                final String extf = ext == null ? "" : ext;
+                runDeep(className + ".init", () -> {
+                    mf.invoke(spf, ctx, extf);
+                    return null;
+                });
+            }
             System.err.println("[art] step#11 init 返回");
         } catch (NoSuchMethodException ignored) { }
         System.err.println("[art] spider " + className + " init 完成 ("
@@ -990,7 +1070,10 @@ public final class Art {
             android.content.pm.ApplicationInfo ai = new android.content.pm.ApplicationInfo();
             ai.packageName = getPackageName();
             ai.dataDir = files.getAbsolutePath();
-            ai.nativeLibraryDir = lib.getAbsolutePath();
+            // ndk 只认 /data/app/<pkg>/lib/arm64 这一个形状（artlaunch 运行时审计实测，
+            // 详见 nativeLibDir() 的完整实测记录）。旧值 /data/catclaw/art/lib 判为
+            // not-bridged → 壳的 arm64 so 走宿主 bionic dlopen → EM_AARCH64。
+            ai.nativeLibraryDir = nativeLibDir().getAbsolutePath();
             ai.sourceDir = cache.getAbsolutePath();
             // ABI 面必须补齐（2026-10-01）：插件装载原生库时会读 primaryCpuAbi / secondaryCpuAbi
             // （不设就是 null），加上 Process.is64Bit() 曾恒 false —— 两处一起把它推去挑

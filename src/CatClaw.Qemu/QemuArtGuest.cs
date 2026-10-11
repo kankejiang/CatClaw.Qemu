@@ -67,6 +67,35 @@ public sealed class QemuArtGuest : IDisposable
     /// <summary>各桥的宿主端口（长度 = <see cref="BridgeCount"/>）：宿主侧多桥连接池用。</summary>
     public int[] BridgePorts => Enumerable.Range(BridgePort, Math.Max(1, BridgeCount)).ToArray();
 
+    // ── 外部桥（2026-10-07，Arch + Waydroid 路线）─────────────────────────────
+    /// <summary>
+    /// 外部桥端点（<c>host:port</c>）：设了就用它，<b>不自起 QEMU</b>。
+    ///
+    /// <para><b>为什么</b>：新路线把桥跑在 Waydroid 的 ART 里（Arch guest → LXC → Android 13），
+    /// 已由外部脚本起好并监听；宿主只需连上去，不需要也不应该再起一套 QEMU + 旧 initrd
+    /// （两套 VM 会各占 2~6GB 且抢同一批端口）。</para>
+    ///
+    /// <para>来源：环境变量 <c>CATCLAW_EXTERNAL_BRIDGE</c>，取值形如
+    /// <c>127.0.0.1:18581</c>。未设时行为与从前完全一致（自起 VM）。</para>
+    /// </summary>
+    public string? ExternalBridge { get; set; }
+
+    /// <summary>是否处于外部桥模式（外部桥模式下 <see cref="BridgePort"/> 由配置给出，不是 PickFreePort 挑的）。</summary>
+    public bool UsingExternalBridge => !string.IsNullOrWhiteSpace(ExternalBridge);
+
+    /// <summary>
+    /// 外部桥的宿主地址（从 <see cref="ExternalBridge"/> 的 host 部分解析出来）。
+    /// <para>⚠ 2026-10-08 修：外部桥模式下探针原先硬编码 <c>IPAddress.Loopback</c>，
+    /// 于是「直连 192.168.240.112:18581」被解析成端口 18581 + 回环地址 → 探针永远打不通
+    /// （实测症状：日志只有「外部桥模式…」，始终没有「guest 桥就绪」，站点全超时）。
+    /// TAP 直连架构下桥在 Android 的真实 IP 上，必须按 host 连。</para>
+    /// </summary>
+    public string ExternalBridgeHost { get; private set; } = "127.0.0.1";
+
+    /// <summary>桥连接的解析目标：外部桥模式用其 host，否则回环。</summary>
+    private IPAddress BridgeTarget =>
+        UsingExternalBridge && IPAddress.TryParse(ExternalBridgeHost, out var ip) ? ip : IPAddress.Loopback;
+
     /// <summary>guest 里爬虫自带 /proxy 服务的端口（桥的 Art.serveProxy 绑的就是它，TVBox 惯例）。</summary>
     public const int GuestProxyPort = 9978;
 
@@ -113,7 +142,7 @@ public sealed class QemuArtGuest : IDisposable
     public long PersistDeviceCapacityBytes { get; set; } = 16L * 1024 * 1024 * 1024;
 
     /// <summary>持久数据盘是否在用（宿主已挂 persist 镜像）——JavaSpiderRuntime 据此跳过 prefs 回灌。</summary>
-    public bool PersistentDataDisk => _vm?.PersistStore is not null;
+    public bool PersistentDataDisk => !UsingExternalBridge && _vm?.PersistStore is not null;
 
     /// <summary>合并模式使用的 initrd 文件名。</summary>
     public string MergedInitrdName { get; set; } = "art_initrd_merged.gz";
@@ -122,6 +151,9 @@ public sealed class QemuArtGuest : IDisposable
     {
         _runtimeDir = runtimeDir;
         _log = log;
+        // 外部桥（2026-10-07）：CATCLAW_EXTERNAL_BRIDGE=host:port → 不自起 QEMU，直连外部桥。
+        var ext = Environment.GetEnvironmentVariable("CATCLAW_EXTERNAL_BRIDGE");
+        if (!string.IsNullOrWhiteSpace(ext)) ExternalBridge = ext.Trim();
         // 进程退出兜底停 VM。⚠ 存成字段并在 Dispose 里摘掉：桥超时重置会反复 new 本类，
         // 用 lambda 直接挂就是每次重置漏一个订阅（且会去 Dispose 一个已经废掉的实例）。
         _onExit = (_, _) => Dispose();
@@ -141,7 +173,13 @@ public sealed class QemuArtGuest : IDisposable
     /// <summary>ART 运行时是否已部署（缺 art_initrd.gz 时整条 ART 路静默不启用）。</summary>
     public static bool IsAvailable(string runtimeDir) => QemuHostRuntime.IsPresent(runtimeDir, InitrdName);
 
-    public bool IsUp => _sock is { Connected: true } && _vm is { IsRunning: true };
+    /// <summary>
+    /// 桥会话是否已建立。
+    /// <para>外部桥模式（<see cref="UsingExternalBridge"/>）下没有本地 <c>_vm</c>——
+    /// 桥在外部（Waydroid 的 ART）里跑，本类只持有连接，故判据退化为「连接在且已 Connected」。</para>
+    /// </summary>
+    public bool IsUp => _sock is { Connected: true }
+        && (UsingExternalBridge || _vm is { IsRunning: true });
 
     /// <summary>
     /// 多桥（2026-10-04）：连上第 <paramref name="bridgeIndex"/> 个桥，返回它的行列式传输流。
@@ -160,14 +198,18 @@ public sealed class QemuArtGuest : IDisposable
     public async Task<(StreamWriter Stdin, StreamReader Stdout)?> ConnectBridgeAsync(int bridgeIndex)
     {
         if (bridgeIndex <= 0 || bridgeIndex >= Math.Max(1, BridgeCount)) return null;
-        if (!_vm?.IsRunning ?? true) return null;
+        // 外部桥模式没有本地 _vm（桥在外部），跳过 VM 存活判据
+        if (!UsingExternalBridge && (!_vm?.IsRunning ?? true)) return null;
 
         // 副桥的**宿主**端口由 QemuHostRuntime.StartAsync 探测并记在 SideBridgePorts 里
         // （guest 内仍是 GuardPort + index；不能直接用 BridgePort + index，那段可能已被
         //  adb/GoProxy 隧道占用 → QEMU 起不来，见 QemuHostRuntime 里的说明）。
         var port = _vm?.SideBridgePorts.FirstOrDefault(x => x.Guest == BridgePort + bridgeIndex).Host ?? 0;
         if (port <= 0) return null;
-        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(45);
+        // 45s→90s（2026-10-11）：guest 侧桥2/3 错峰启动（探测+15s）后 ART 冷启要 30-45s，
+        // 45s 窗口在机器忙时不够 → host 判“未就绪”退单桥，keeper 60s 后才补连 → 出现两分钟单桥真空期
+        // （15:31 boot 实测：15:33:05 报未就绪、15:34:01 才多桥就绪）。90s 覆盖慢启动。
+        var deadline = DateTime.UtcNow + TimeSpan.FromSeconds(90);
         while (DateTime.UtcNow < deadline && !_disposed && (_vm?.IsRunning ?? false))
         {
             TcpClient? c = null;
@@ -223,7 +265,9 @@ public sealed class QemuArtGuest : IDisposable
         //   所以这里用一次真的 ping 当就绪探针，不通就换一条连接重来。
         var deadline = DateTime.UtcNow + TimeSpan.FromMinutes(4);   // 冷启动：解 226MB initrd + ART 起 VM
         // _disposed 进入条件：实例被并发收尾时探针立即退出返回 null，不再傻等满 4 分钟
-        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested && !_disposed)
+        // 外部桥模式：没有本地 _vm 可判存活，只看到期/取消/disposed。
+        while (DateTime.UtcNow < deadline && !ct.IsCancellationRequested && !_disposed
+               && (UsingExternalBridge || (_vm?.IsRunning ?? false)))
         {
             TcpClient? c = null;
             try
@@ -231,7 +275,7 @@ public sealed class QemuArtGuest : IDisposable
                 c = new TcpClient { NoDelay = true };
                 using var connCts = CancellationTokenSource.CreateLinkedTokenSource(ct);
                 connCts.CancelAfter(3000);
-                await c.ConnectAsync(IPAddress.Loopback, BridgePort, connCts.Token).ConfigureAwait(false);
+                await c.ConnectAsync(BridgeTarget, BridgePort, connCts.Token).ConfigureAwait(false);
                 var ns = c.GetStream();
                 var w = new StreamWriter(ns, new UTF8Encoding(false)) { AutoFlush = true };
                 var r = new StreamReader(ns, Encoding.UTF8);
@@ -264,7 +308,7 @@ public sealed class QemuArtGuest : IDisposable
                     }
                     if (owns)
                     {
-                        Log($"guest 桥就绪 127.0.0.1:{BridgePort}（探针应答 {line}）");
+                        Log($"guest 桥就绪 {ExternalBridgeHost}:{BridgePort}（探针应答 {line}）");
                         return (_w, _r);
                     }
                     Log("guest 桥已被并发调用方接管，本探针让位重试");
@@ -288,6 +332,29 @@ public sealed class QemuArtGuest : IDisposable
     /// 与本类的桥就绪探针互不依赖（TCG 下桥就绪要几分钟，磁力任务不该等）。</para></summary>
     private async Task<bool> StartVmLockedAsync(CancellationToken ct)
     {
+        // ── 外部桥模式（2026-10-07）：不自起 QEMU，直接用外部已就绪的桥端点 ──
+        // 桥跑在 Waydroid 的 ART 里（Arch guest → LXC → Android 13），由外部脚本起好。
+        // 本方法只解析端点、置 BridgePort，跳过三件套校验与 QEMU 启动。
+        if (UsingExternalBridge)
+        {
+            var ep = ExternalBridge!.Trim();
+            var colon = ep.LastIndexOf(':');
+            if (colon > 0) ExternalBridgeHost = ep.Substring(0, colon);
+            if (BridgePort <= 0)
+            {
+                var portText = colon >= 0 ? ep.Substring(colon + 1) : ep;
+                if (!int.TryParse(portText, out var extPort) || extPort <= 0)
+                {
+                    Log("外部桥端点无效（需 host:port）：" + ep);
+                    return false;
+                }
+                BridgePort = extPort;
+                BridgeCount = 1;
+                Log($"外部桥模式：不自起 QEMU，直连 {ep}（桥端口 {BridgePort}）");
+            }
+            return true;
+        }
+
         // 三件套校验按架构取文件名（x86 mini guest：Debian 内核 + x86 引擎 + art_initrd_x64.gz）
         var qemuExe = GuestArch == GuestArch.X86_64 ? GuestQemuExeName : "qemu-system-aarch64.exe";
         // ⚠ 架构优先于合并：merged initrd 是 aarch64 专属（x86 的迅雷走 qemu-aarch64-static

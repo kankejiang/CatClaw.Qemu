@@ -40,6 +40,40 @@ public class Server {
     // 响应按 id 乱序回写（宿主 RoundTripAsync 按 id 匹配，proxy op 当年已因同一理由异步化）。
     private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.locks.ReentrantLock> SITE_LOCKS =
             new java.util.concurrent.ConcurrentHashMap<>();
+    /** jar → 单线程执行 lane：同 jar 的 load/call 全进同一条 lane 串行执行。
+     * 同一 ART 进程内 FishNative 转译加载是进程级单例语义，并发 load 同一 jar 即转译层抢 so
+     * 句柄 → 第二站 init 内 SIGSEGV（PC=fb17）。宿主侧串行锁管不住 guest 内线程池并发，
+     * 必须在执行侧按 jar 收敛到单线程（重构：崩溃域隔离，保单 VM）。不同 jar 仍走各自 lane 并行。 */
+    private static final java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.ExecutorService> JAR_LANES =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    /** 站点 → 装载时用的 jar 规范 URL：call 请求不带 jar，用它找回所属 lane。 */
+    private static final java.util.concurrent.ConcurrentHashMap<String, String> SITE_JAR =
+            new java.util.concurrent.ConcurrentHashMap<>();
+    private static java.util.concurrent.ExecutorService laneFor(String jarKey) {
+        return JAR_LANES.computeIfAbsent(jarKey, k -> java.util.concurrent.Executors.newSingleThreadExecutor(r -> {
+            Thread t = new Thread(r, "bridge-jar-lane");
+            t.setDaemon(true);
+            return t;
+        }));
+    }
+    /** 从请求里取 lane 键：load 取首个 jar URL；call 按站点已装载的 jar 回查；无 jar 返回 null（走公共池）。 */
+    private static String laneJarKey(org.json.JSONObject req, String fop) {
+        try {
+            if ("load".equals(fop)) {
+                for (String p : new String[]{req.optString("rawJar", null), req.optString("shellJar", null), req.optString("realJar", null)}) {
+                    if (p != null && !p.isEmpty()) return p;
+                }
+                org.json.JSONArray js = req.optJSONArray("jars");
+                if (js != null && js.length() > 0) {
+                    String p = js.optString(0, null);
+                    if (p != null && !p.isEmpty()) return p;
+                }
+                return null;
+            }
+            if ("call".equals(fop)) return SITE_JAR.get(req.optString("site", ""));
+        } catch (Throwable ignored) { }
+        return null;
+    }
     /** stdout 写回互斥：call/load 异步化后多线程 println 会交错破坏行协议。 */
     private static final Object OUT_LOCK = new Object();
     private static java.util.concurrent.ExecutorService CALL_POOL;
@@ -114,6 +148,8 @@ public class Server {
         return false;
     }
 
+    private static volatile boolean SYNC_STARTED = false;
+
     public static void main(String[] args) throws Exception {
         // 静默线程死亡的最后一道眼：网盘登录保存链若在某线程悄悄抛异常被壳吞掉，这里抓不到；
         // 但**未捕获**的异常（保存线程被炸死）一定会从这里过 —— 配合 stackdump 定位（2026-10-02）。
@@ -131,6 +167,10 @@ public class Server {
         // 起因：原逻辑只在每个 call 结束时同步，于是「扫码成功但之后没再调用该站」时
         // config.db 永远不上行，宿主拿不到 Cookie，VM 重启登录态即丢（用户 2026-10-04 反馈）。
         // 这里加一个 5s 周期线程：开机、扫码后不必再触发任何调用，Cookie 都会被推给宿主。
+        // ★ 幂等守卫（2026-10-06 Round33）：GuestMain 的 accept 循环复用同一 ART 进程跑多次
+        // Server.main，每次都起一个同步线程 → N 个线程每 5s 同时 sharedbSync（刷屏 + 抢写）。
+        // 同一进程只起一次。
+        if (!SYNC_STARTED) { SYNC_STARTED = true;
         try {
             Thread sync = new Thread(() -> {
                 while (true) {
@@ -141,6 +181,7 @@ public class Server {
             sync.setDaemon(true);
             sync.start();
         } catch (Throwable ig) { }
+        } // SYNC_STARTED
 
         // 把 AES/*/PKCS7 别名到 PKCS5（标准 JVM 不提供 PKCS7 命名）→ 否则爬虫的接口加解密直接失败。
         // ART 里不装：conscrypt 自带的 BC 原生就认 PKCS7Padding，我们的包装反而会盖掉真实现。
@@ -223,8 +264,13 @@ public class Server {
             if ("call".equals(fop) || "load".equals(fop)) {
                 // call/load 重活异步执行（见 SITE_LOCKS 注释）：慢源不再堵快源，
                 // 搜索/切站的多源并发真正并行。轻 op（ping/probe/prefs…）保持同步直答。
+                // ★ 重构：同 jar 进同一条单线程 lane 串行（不同 jar 仍并行）。宿主侧串行锁管不住
+                // guest 内线程池并发，转译层抢 so 句柄只能在执行侧收敛。无 jar 键时回落公共池。
                 final JSONObject freq = req;
-                CALL_POOL.submit(() -> {
+                String laneKey = laneJarKey(req, fop);
+                java.util.concurrent.ExecutorService lane =
+                        laneKey != null ? laneFor(laneKey) : CALL_POOL;
+                lane.submit(() -> {
                     OpWatchdog.begin(fid, fop);   // 主循环随后的 OP_START 清零会盖掉 begin，任务内重设
                     String o;
                     try {
@@ -249,12 +295,12 @@ public class Server {
                 });
                 continue;
             }
+            // ★ 直修（不回滚）：load/call 已在上面异步双分发（CALL_POOL.submit），这里不再同步执行。
+            // 同一条 load 被执行两次 = 同一进程两次 new DexClassLoader + 两次 FishNative 转译加载，
+            // 第二次取 jar 落盘（materialize 重写同名文件）正撞上第一次的转译 dlopen → SIGSEGV
+            // （04:20:07 Manbo 返回后 150ms 内崩、04:18:48 双 jar 并发同机理实锤）。
             try {
                 Object result = switch (fop) {
-                    case "load" -> loadFull(req.optString("site"), req.optString("className"), req.optString("ext"), req.optJSONArray("jars"),
-                            req.optString("shellJar", null), req.optString("rawJar", null), req.optString("realJar", null),
-                            req.optInt("guardPort", 0), req.optBoolean("force", false));
-                    case "call" -> call(req.optString("site"), req.optString("method"), req.optJSONArray("args"));
                     case "writefile" -> {
                         // 宿主回灌持久化文件（网盘 Cookie 的 sharedb）：guest /data 是 tmpfs，
                         // VM 冷启即清，握手后把上次会话保存的文件写回来。路径白名单防任意写。
@@ -867,6 +913,14 @@ public class Server {
             if (Art.onArt()) {
                 String jar = firstDexJar(rawJar, shellJar, realJar, jars);
                 if (jar == null) throw new IllegalStateException("ART guest 只能装载 dex 型 jar（纯 class 的 java 源请留在宿主 JVM）: site=" + site);
+                // ★ 重构：登记站点→jar 规范 URL，供后续 call 请求找回所属 lane（call 请求本身不带 jar）。
+                // 用 load 请求的 lane 键（与 laneJarKey 取法一致），保证 load 与后续 call 同 lane。
+                String laneKey = rawJar;
+                if (laneKey == null || laneKey.isEmpty()) {
+                    org.json.JSONArray js = jars;
+                    if (js != null && js.length() > 0) laneKey = js.optString(0, null);
+                }
+                if (laneKey != null && !laneKey.isEmpty()) SITE_JAR.put(site, laneKey);
                 SPIDERS.put(site, Art.loadSpider(site, jar, className, ext));
                 System.err.println("[srv] ART 已装载: " + site + " ← " + jar);
                 return "loaded";
@@ -1080,12 +1134,16 @@ public class Server {
 
     /** op 处理超时看门狗：>45s 未完成的 op 把全部线程栈 dump 到 stderr（挂死现场一次，换 id 重置）。 */
     private static final class OpWatchdog {
+        private static volatile boolean WD_STARTED = false;
         static void begin(long id, String op) {
             OP_DUMPED.clear();
             OP_START.set(System.currentTimeMillis());
         }
 
-        static void start() {
+        // ★ 幂等守卫（2026-10-06 Round33）：同一 ART 进程多次 Server.main 只起一个看门狗。
+        static synchronized void start() {
+            if (WD_STARTED) return;
+            WD_STARTED = true;
             Thread t = new Thread(() -> {
                 while (true) {
                     long st = OP_START.get();

@@ -54,10 +54,21 @@ if [ -d "$NDK" ]; then
 else
     echo "WARN: 缺 ndk_translation prebuilts，Guard 源不可用"
 fi
-# ── arm64 专用 linker 配置（决定性，2026-09-27）──
+# ── arm64 专用 linker 配置（决定性，2026-09-27；2026-10-10 补 /thunder）──
 # ndk 的 arm64 linker64 按自身 ISA 找 /system/etc/ld.config.arm64.txt，找不到才回落
 # /linkerconfig/ld.config.txt（x86 内容）→ 搜到 x86 libc++ → EM 不符 FATAL。
 # 这份只给 arm64 侧：搜索路径全指 arm64 子目录；x86 linker 继续用 /linkerconfig 那份，互不干扰。
+#
+# ⚠ /thunder 是必须补的（2026-10-10 实测取证）：Guard 壳（类名 *Guard，jar ef8178b9…）
+#   运行期把 arm64 so 解到 /thunder/data/cache/.ftyfn…  再 System.load。
+#   而 permitted.paths 白名单里没有 /thunder → arm64 linker 的 namespace 拒绝该路径
+#   → ndk 判定该 namespace 非 bridged → System.load 退回宿主 bionic dlopen，
+#   按 x86_64 解析 arm64 ELF，直接抛
+#   「dlopen failed: "/thunder/data/cache/.ftyfn…" is for EM_AARCH64 (183) instead of EM_X86_64 (62)」。
+#   同根因的另一处落点是 /thunder/data/fishso（libFishGuard-v8-*.so，700KB arm64）。
+#   审计证据（artlaunch 探针）：IsSupported(/system/lib64/arm64/libc++.so)=1、
+#   NativeBridgeLoadLibrary=OK，但 IsPathSupported(全部候选)=0 —— 桥起来了却不管这些路径。
+#   把 /thunder 与其下三个数据目录整体加白名单，permitted 是前缀匹配，一并覆盖。
 cat > $R/system/etc/ld.config.arm64.txt <<'ARM64CFG'
 dir.system = /system/bin
 dir.system = /system/xbin
@@ -65,12 +76,12 @@ dir.system = /system/xbin
 [system]
 namespace.default.isolated = false
 namespace.default.search.paths = /system/lib64/arm64
-namespace.default.permitted.paths = /system/lib64/arm64:/system/lib64:/system/bin:/data:/data/catclaw
+namespace.default.permitted.paths = /system/lib64/arm64:/system/lib64:/system/bin:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files
 
 namespace.sphal.isolated = false
 namespace.sphal.visible = true
 namespace.sphal.search.paths = /system/lib64/arm64
-namespace.sphal.permitted.paths = /system/lib64/arm64:/data:/data/catclaw
+namespace.sphal.permitted.paths = /system/lib64/arm64:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files
 ARM64CFG
 echo "arm64 linker 配置已生成"
 
@@ -144,8 +155,38 @@ additional.namespaces = com_android_art
 namespace.com_android_art.isolated = false
 namespace.com_android_art.visible = true
 namespace.com_android_art.search.paths = /apex/com.android.art/${LIB}
-namespace.com_android_art.permitted.paths = /apex/com.android.art/${LIB}:/system/${LIB}:/data:/data/catclaw
+# ⚠ /thunder 必须在内（2026-10-10）：Guard 壳的 arm64 so 解到 /thunder/data/cache/.
+#   缺它 → ART 的 classloader namespace 判定该路径不受支持 → ndk 不接管 →
+#   System.load 退回 bionic dlopen 按 x86_64 解析 arm64 ELF → 「EM_AARCH64 instead of EM_X86_64」。
+namespace.com_android_art.permitted.paths = /apex/com.android.art/${LIB}:/system/${LIB}:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files
 APXNS
+
+# ── 4.5 迅雷资产（单VM合并：TVBox原样，缺件即跳过不致命）──
+# 来源（108）：/root/x86guest/thunder-assets/{harness,qemu-aarch64-static,thunder-arm/,thunder-data/}。
+# 哈希锚定：libxl_thunder_sdk.so bb37174881bc4d65daf1e8c54cc14a1f / libxl_stat.so 71814a347556814bcd4668b289de5ab6。
+# init_x86.sh 迅雷段约定路径：/thunder/harness + /thunder/qemu-aarch64-static；引擎库走 bionic 常规路径。
+# ★ harness 版本（2026-10-05 Round10 实测）：thunder-assets/harness（9-29，213264B）
+# 在 108 本机可跑通全链路；thunder/harness（9-27，213104B）在 guest 内秒退 255。
+# 单VM 必须用新版；旧版只留作回退参照。
+# ★ ARM 树必须隔离在 /thunder/sysroot（2026-10-05 Round11 实测血的教训）：
+# 曾把 ARM 的 libc/log/m 等拷进 /system/lib64，直接毒化 x86 linker 命名空间 ——
+# artlaunch 报 "/system/lib64/liblog.so is for EM_AARCH64" 全崩，桥连带去世。
+# 现在 ARM linker+libs 只活在 sysroot 里，qemu-aarch64-static -L 指向它，x86 侧零污染。
+TH_SRC="$W/thunder-assets"
+if [ -x "$TH_SRC/harness" ] && [ -f "$TH_SRC/thunder-arm/system/lib64/libxl_thunder_sdk.so" ]; then
+    mkdir -p $R/thunder $R/thunder/sysroot/system/bin $R/thunder/sysroot/system/lib64
+    cp "$TH_SRC/harness" $R/thunder/harness
+    if [ -x "$TH_SRC/qemu-aarch64-static" ]; then cp "$TH_SRC/qemu-aarch64-static" $R/thunder/qemu-aarch64-static; fi
+    if [ -f "$TH_SRC/thunder-arm/system/bin/linker64" ]; then cp "$TH_SRC/thunder-arm/system/bin/linker64" $R/thunder/sysroot/system/bin/linker64; fi
+    cp "$TH_SRC/thunder-arm/system/lib64/libxl_thunder_sdk.so" "$TH_SRC/thunder-arm/system/lib64/libxl_stat.so" $R/thunder/sysroot/system/lib64/ 2>/dev/null || true
+    for d in libc.so libdl.so liblog.so libm.so libstdc++.so libz.so libc++.so libandroid.so; do
+        [ -f "$TH_SRC/thunder-arm/system/lib64/$d" ] && cp "$TH_SRC/thunder-arm/system/lib64/$d" $R/thunder/sysroot/system/lib64/ 2>/dev/null || true
+    done
+    chmod +x $R/thunder/harness $R/thunder/qemu-aarch64-static 2>/dev/null || true
+    echo "迅雷资产已注入（/thunder + sysroot 隔离的 ARM 树，/system 零污染）"
+else
+    echo "迅雷资产缺失（$TH_SRC/harness 或引擎库不在）→ 跳过，initrd 仍为纯桥形态（thunderport=0 即零副作用）"
+fi
 
 # ── 5. /apex/apex-info-list.xml（linkerconfig 元数据）──
 python3 - <<PYEOF

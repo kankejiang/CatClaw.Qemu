@@ -79,6 +79,8 @@ export TMPDIR=/data/local/tmp
 export LD_LIBRARY_PATH=/apex/com.android.art/lib64:/apex/com.android.os.statsd/lib64:/system/lib64
 # 13 的 boot classpath：core 五件在 ART apex，framework 件在 /system/framework
 # BCP 全部走 /system 路径（core jar 已从 apex 拷出）——避免触发 apex linker namespace
+# ★ Round57 结论：-Xint 验证还崩（PC 同为 fb17）→ 凶手不是 JIT，已回滚。
+# 性能 3-5 倍损失不能留生产。转 B 方案（壳 so 预加载，见 Art.java）。
 export CATCLAW_JVM_EXTRA="-Xnoimage-dex2oat -Xnodex2oat"
 export CATCLAW_BCP="/system/javalib/core-oj.jar:/system/javalib/core-libart.jar:/system/javalib/core-icu4j.jar:/system/javalib/okhttp.jar:/system/javalib/bouncycastle.jar:/system/javalib/apache-xml.jar:/system/javalib/conscrypt.jar:/system/framework/framework.jar:/system/framework/ext.jar:/system/framework/telephony-common.jar:/system/framework/voip-common.jar:/system/framework/ims-common.jar:/system/framework/android.hidl.base-V1.0-java.jar:/system/framework/android.hidl.manager-V1.0-java.jar:/system/framework/android.test.base.jar"
 
@@ -89,6 +91,51 @@ export CATCLAW_BCP="/system/javalib/core-oj.jar:/system/javalib/core-libart.jar:
 mkdir -p /binfmt_misc
 mount -t binfmt_misc none /binfmt_misc 2>/dev/null
 echo ':arm64_exe:M::\x7fELF\x02\x01\x01\x00\x00\x00\x00\x00\x00\x00\x00\x00\x02\x00\xb7::/system/bin/ndk_translation_program_runner_binfmt_misc_arm64:P' > /binfmt_misc/register 2>/dev/null && echo "[init] binfmt arm64 已注册" || echo "[init] binfmt 注册跳过"
+# ── arm64 linker namespace 白名单：/thunder 必须在内（2026-10-10）──
+# 与 mk_x86_initrd.sh 生成的 ld.config.arm64.txt 保持一致；这里在运行时再覆写一遍，
+# 好处是不必为改一行白名单重打 413MB initrd（initrd 是打包产物，改它要走另一台构建机）。
+#
+# 起因（实锤）：Guard 壳（类名 *Guard，jar ef8178b9…）运行期把 arm64 so 解到
+#   /thunder/data/cache/.ftyfn… 再 System.load。旧白名单 permitted.paths 只有
+#   /system/…:/data:/data/catclaw —— 没有 /thunder，于是 arm64 linker 的 namespace
+#   判定该路径不受支持 → ndk 不接管 → System.load 退回宿主 bionic dlopen 按 x86_64
+#   解析 arm64 ELF，抛「is for EM_AARCH64 (183) instead of EM_X86_64 (62)」。
+#   同一批站因此全部加载失败（2026-10-10：探测 97 站失败 97）。
+#   /thunder/data/fishso/libFishGuard-v8-*.so 是同一根因的另一落点。
+cat > /system/etc/ld.config.arm64.txt <<'ARM64CFG'
+dir.system = /system/bin
+dir.system = /system/xbin
+
+[system]
+namespace.default.isolated = false
+namespace.default.search.paths = /system/lib64/arm64
+namespace.default.permitted.paths = /system/lib64/arm64:/system/lib64:/system/bin:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files
+
+namespace.sphal.isolated = false
+namespace.sphal.visible = true
+namespace.sphal.search.paths = /system/lib64/arm64
+namespace.sphal.permitted.paths = /system/lib64/arm64:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files
+ARM64CFG
+echo "[init] arm64 linker 白名单已含 /thunder（Guard 壳 arm64 so 落点）"
+
+# ── x86 侧 ld.config.txt：com_android_art namespace 同样要放行 /thunder ──
+# 桥进程（x86_64）经 ART 的 classloader 加载壳 so 时，判定走的是这份配置里的
+# namespace.com_android_art.permitted.paths。它同样缺 /thunder（2026-10-10 实测：
+# artlaunch 探针 IsPathSupported 对全部候选返回 0，含 /data/catclaw/art/lib）。
+# 只改 arm64 那份不够——两份都要放行。
+if [ -f /linkerconfig/ld.config.txt ]; then
+    if grep -q "^namespace.com_android_art.permitted.paths" /linkerconfig/ld.config.txt; then
+        $BB sed -i "s|^namespace.com_android_art.permitted.paths = \(.*\)|namespace.com_android_art.permitted.paths = \1:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files|" /linkerconfig/ld.config.txt \
+            && echo "[init] x86 linker 白名单已含 /thunder" || echo "[init] WARN x86 白名单改写失败"
+    else
+        echo "additional.namespaces = com_android_art" >> /linkerconfig/ld.config.txt
+        echo "namespace.com_android_art.isolated = false" >> /linkerconfig/ld.config.txt
+        echo "namespace.com_android_art.visible = true" >> /linkerconfig/ld.config.txt
+        echo "namespace.com_android_art.search.paths = /apex/com.android.art/lib64" >> /linkerconfig/ld.config.txt
+        echo "namespace.com_android_art.permitted.paths = /apex/com.android.art/lib64:/system/lib64:/data:/data/catclaw:/thunder:/thunder/data:/thunder/data/cache:/thunder/data/fishso:/thunder/data/files" >> /linkerconfig/ld.config.txt
+        echo "[init] x86 linker 补建 com_android_art namespace（含 /thunder）"
+    fi
+fi
 # ── 开机清理上次残留的 Go 代理进程（pvideo / moyu_go）──
 # 2026-10-03：网盘爬虫拉起 GoProxy 前会检查「是否已有实例」，残留进程会让它反复失败
 # 并经 ui-toast 弹「Go代理 N 进程仍在退出」（用户观感：老弹窗）；而它自己可能清不掉
@@ -100,6 +147,67 @@ for _p in pvideo moyu_go goproxy; do
     done
 done
 $BB rm -f /data/files/moyu_go/*.pid /data/local/tmp/*.pid 2>/dev/null
+# ── 迅雷段（单VM合并：TVBox原样，默认关闭零副作用）──
+# thunderport=0/缺省即整段跳过；资产缺失（/thunder/harness无）也跳过。
+# 启用后：/thunder-data tmpfs + harness监督循环（EXIT可重启，每秒轮询宿主10.0.2.2:$THUNDERPORT/task）。
+THUNDERPORT=$(getarg thunderport); [ -n "$THUNDERPORT" ] || THUNDERPORT=0
+TBDATA=$(getarg blkdev); TSWAP=$(getarg swapdev); TDATA_T=$(getarg tdata); [ -n "$TDATA_T" ] || TDATA_T=3500m
+if [ "$THUNDERPORT" = "0" ] || [ -z "$THUNDERPORT" ]; then
+    echo "[thunder] 未启用（thunderport=0/缺省），跳过迅雷段"
+else
+    echo "[thunder] 启用：thunderport=$THUNDERPORT blkdev=${TBDATA:-（无）} swapdev=${TSWAP:-（无）} tdata=$TDATA_T"
+    $BB mkdir -p /thunder-data
+    $BB mount -t tmpfs -o size=$TDATA_T tmpfs /thunder-data 2>&1 || echo "[thunder] /thunder-data挂载失败（不致命，harness回退）"
+    if [ -n "$TSWAP" ] && [ -b "$TSWAP" ]; then
+        $BB mkswap "$TSWAP" 2>&1 | $BB tail -2
+        $BB swapon "$TSWAP" 2>&1 || echo "[thunder] swapon失败，退化纯内存"
+    fi
+    export CTRL_HOST="10.0.2.2"
+    export CTRL_PORT="$THUNDERPORT"
+    export PROXY_PORT="20080"
+    export MAGNET="none"
+    export QCO="${QCO:-1}"
+    export BLK_DEV="$TBDATA"
+    TH_HARNESS="/thunder/harness"
+    TH_QEMU="/thunder/qemu-aarch64-static"
+    if [ ! -x "$TH_HARNESS" ]; then
+        echo "[thunder] 缺 $TH_HARNESS，跳过拉起（等initrd注入迅雷资产）"
+    else
+        # ★ 转译执行必须 -L /thunder/sysroot（2026-10-05 Round11）：-L / 会让 ARM linker
+        # 读到 /system/bin/linker64（x86 的）→ Invalid ELF 秒退 255，且 ARM 的 liblog 会毒化
+        # x86 linker 命名空间（组装侧已把 ARM 树隔离进 sysroot，/system 零污染）。
+        # sysroot 内含 ARM 的 linker64 + libc/log/m + 引擎库；缺失即跳过拉起。
+        # ★ LD_LIBRARY_PATH 绝不能 export（2026-10-06 Round12 实测血的教训）：
+        # ARM 的 libdl 会毒化 x86 artlaunch 的 linker 命名空间 → 桥 CANNOT LINK 全崩。
+        # 只给 harness 单次调用加前缀（VAR=value cmd 仅作用于该命令），桥不受影响。
+        if [ -x "$TH_QEMU" ] && [ -f "/thunder/sysroot/system/bin/linker64" ]; then
+            TH_RUN="$TH_QEMU -L /thunder/sysroot /thunder/harness"
+        elif [ -x "$TH_HARNESS" ]; then
+            echo "[thunder] 缺 sysroot linker（/thunder/sysroot/system/bin/linker64），跳过拉起"
+            TH_RUN=""
+        else
+            TH_RUN="$TH_HARNESS"
+        fi
+        if [ -z "$TH_RUN" ]; then
+            echo "[thunder] harness 不可执行，跳过（等initrd注入迅雷资产）"
+        else
+        cd /thunder 2>/dev/null || true
+        (
+            while true; do
+                echo "[thunder] 拉起harness：$TH_RUN（回连10.0.2.2:$THUNDERPORT）"
+                LD_LIBRARY_PATH="/thunder/sysroot/system/lib64" $TH_RUN &
+                THP=$!
+                while $BB kill -0 $THP 2>/dev/null; do $BB sleep 5; done
+                wait $THP 2>/dev/null
+                THRC=$?
+                echo "[thunder] harness已退出，退出码=$THRC，2s后拉起（VM/桥/data不动）"
+                $BB sleep 2
+            done
+        ) &
+        echo "[thunder] harness监督循环已起"
+        fi
+    fi
+fi
 # ── 桥进程监督器（2026-10-04 重写）──
 #
 # 旧实现：桥一死就 break 出去 sleep 3600 空转，等宿主杀 VM 重来（~20s，期间所有 jar 源全灭）。
@@ -142,8 +250,12 @@ while [ $i -lt $NBRIDGE ]; do
             if [ -n "$SELFTEST" ] && [ "$i" -eq 0 ] && [ $try_n -eq 0 ]; then
                 (
                     $BB sleep "$SELFTEST"
+                    # ⚠ 必须走 busybox 完整 applet 路径：本 init 是 ash 直跑，裸 kill 不是
+                    # applet 会静默不做事（2026-10-10 实测 selftest=70 传到了 QEMU、
+                    # guest 里却一条自检日志都没有 —— kill 从未执行）。
                     echo "[init] 自检：主动杀掉桥 pid=$LP（验证监督器重启）"
-                    kill -9 $LP 2>/dev/null
+                    $BB kill -9 "$LP" 2>/dev/null || kill -9 "$LP" 2>/dev/null
+                    echo "[init] 自检：kill 已发出，pid=$LP"
                 ) &
             fi
             # 等桥退出：轮询 kill -0（比 wait 稳），再 wait 取退出码
